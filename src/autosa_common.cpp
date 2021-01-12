@@ -54,7 +54,6 @@ void *autosa_kernel_free(struct autosa_kernel *kernel)
     isl_ast_expr_free(array->bound_expr);
     
     isl_pw_qpolynomial_free(array->serialize_bound);    
-    //array->group_ref_mem_port_map.clear();
   }
   if (kernel->array)
     free(kernel->array);
@@ -64,7 +63,7 @@ void *autosa_kernel_free(struct autosa_kernel *kernel)
     free(kernel->var[i].name);
     isl_vec_free(kernel->var[i].size);
   }
-  free(kernel->var);
+  free(kernel->var);  
 
   free(kernel);
   return NULL;
@@ -225,7 +224,7 @@ struct autosa_kernel *autosa_kernel_alloc(isl_ctx *ctx, struct ppcg_scop *scop)
   kernel->expanded_domain = NULL;
   kernel->host_domain = NULL;
   kernel->domain = NULL;
-  kernel->single_statement = 0;
+  kernel->single_statement = 0;  
 
   return kernel;
 }
@@ -890,7 +889,10 @@ struct autosa_array_ref_group *autosa_array_ref_group_free(
   free(group->io_buffers);
   isl_schedule_free(group->io_schedule);
   isl_schedule_free(group->io_L1_schedule);
+  isl_schedule_free(group->io_L1_lower_schedule);
   isl_union_pw_multi_aff_free(group->copy_schedule);
+  if (group->attached_drain_group)
+    autosa_array_ref_group_free(group->attached_drain_group);
   free(group);
 
   return NULL;
@@ -925,11 +927,13 @@ struct autosa_array_ref_group *autosa_array_ref_group_init(
   group->io_L1_pe_expr_boundary = NULL;
   group->io_schedule = NULL;
   group->io_L1_schedule = NULL;
+  group->io_L1_lower_schedule = NULL;
   group->io_level = 0;
   group->space_dim = 0;
   group->n_lane = 0;
   group->copy_schedule_dim = 0;
   group->copy_schedule = NULL;
+  group->attached_drain_group = NULL;
 
   return group;
 }
@@ -1339,10 +1343,12 @@ void autosa_kernel_stmt_free(void *user)
   case AUTOSA_KERNEL_STMT_IO:
   case AUTOSA_KERNEL_STMT_IO_TRANSFER:
   case AUTOSA_KERNEL_STMT_IO_TRANSFER_BUF:
-  case AUTOSA_KERNEL_STMT_IO_DRAM:
-    free(stmt->u.i.fifo_name);
+  case AUTOSA_KERNEL_STMT_IO_DRAM:    
+    free(stmt->u.i.in_fifo_name);
+    free(stmt->u.i.out_fifo_name);
     isl_ast_expr_free(stmt->u.i.local_index);
     isl_ast_expr_free(stmt->u.i.index);
+    free(stmt->u.i.reduce_op);
     break;
   case AUTOSA_KERNEL_STMT_MODULE_CALL:
   case AUTOSA_KERNEL_STMT_EXT_MODULE:
@@ -1525,6 +1531,8 @@ struct autosa_hw_module *autosa_hw_module_alloc(struct autosa_gen *gen)
   module->serialize_sched = NULL;
   module->serialize_tree = NULL;
   module->coalesce_bound = -1;
+  module->is_serialized = 0;
+  module->use_FF = 0;
 
   return module;
 }
@@ -1832,8 +1840,8 @@ static isl_stat read_sa_sizes_from_set(__isl_take isl_set *set, int *sizes, int 
 
     v = isl_set_plain_get_val_if_fixed(set, isl_dim_set, i);
     if (!v)
-      goto error;
-    sizes[i] = isl_val_get_num_si(v);
+      goto error;    
+    sizes[i] = isl_val_get_num_si(v);    
     isl_val_free(v);
   }
 
@@ -2492,12 +2500,21 @@ static cJSON *extract_loop_info_at_ast_node(__isl_keep isl_ast_node *node,
  */
 static char *extract_loop_info_from_module(
     struct autosa_gen *gen, __isl_keep isl_ast_node *tree,
-    char *module_name, int print)
+    char *module_name, int double_buffer, int in,
+    int print)
 {
+  if (!tree)
+    return NULL;
+
   cJSON *loop_struct = cJSON_CreateObject();
+  cJSON *module_props = cJSON_CreateObject();
   char *json_str = NULL;
 
   cJSON_AddStringToObject(loop_struct, "module_name", module_name);
+  cJSON_AddNumberToObject(module_props, "double_buffer", double_buffer);
+  cJSON_AddNumberToObject(module_props, "in", in);
+  cJSON_AddItemToObject(loop_struct, "module_prop", module_props);
+  
   extract_loop_info_at_ast_node(tree, loop_struct);
 
   /* Print the JSON file */
@@ -2553,30 +2570,36 @@ isl_stat sa_extract_loop_info(struct autosa_gen *gen, struct autosa_hw_module *m
   {
     /* Parse the loop structure of the intra trans module */
     module_name = concat(ctx, module->name, "intra_trans");
-    json_str = extract_loop_info_from_module(gen, module->intra_tree, module_name, 1);
+    json_str = extract_loop_info_from_module(gen, module->intra_tree, module_name, module->double_buffer, module->in, 1);
     free(module_name);
 
     /* Parse the loop structure of the inter trans module */
     module_name = concat(ctx, module->name, "inter_trans");
-    json_str = extract_loop_info_from_module(gen, module->inter_tree, module_name, 1);
+    json_str = extract_loop_info_from_module(gen, module->inter_tree, module_name, module->double_buffer, module->in, 1);
     free(module_name);
 
     if (module->boundary)
     {
       module_name = concat(ctx, module->name, "inter_trans_boundary");
-      json_str = extract_loop_info_from_module(gen, module->inter_tree, module_name, 1);
+      json_str = extract_loop_info_from_module(gen, module->boundary_inter_tree, module_name, module->double_buffer, module->in, 1);
       free(module_name);
     }
   }
 
   /* Parse the loop structure of the default module */
-  json_str = extract_loop_info_from_module(gen, module->device_tree, module->name, 1);
+//#ifdef _DEBUG
+//  if (!module->device_tree) {
+//    printf("non tree module_name: %s\n", module->name);
+//    exit(0);
+//  }
+//#endif
+  json_str = extract_loop_info_from_module(gen, module->device_tree, module->name, module->double_buffer, module->in, 1);
 
   /* Parse the loop structure of the boundary module */
   if (module->boundary)
   {
     module_name = concat(ctx, module->name, "boundary");
-    json_str = extract_loop_info_from_module(gen, module->boundary_tree, module_name, 1);
+    json_str = extract_loop_info_from_module(gen, module->boundary_tree, module_name, module->double_buffer, module->in, 1);
     free(module_name);
   }
 
@@ -2594,7 +2617,7 @@ isl_stat sa_extract_loop_info(struct autosa_gen *gen, struct autosa_hw_module *m
       p_str = isl_printer_print_str(p_str, "_PE_dummy");
       module_name = isl_printer_get_str(p_str);
       isl_printer_free(p_str);
-      json_str = extract_loop_info_from_module(gen, dummy_module->device_tree, module_name, 1);
+      json_str = extract_loop_info_from_module(gen, dummy_module->device_tree, module_name, 0, 0, 1);
       free(module_name);
     }
   }
@@ -2674,7 +2697,7 @@ int extract_memory_type(struct autosa_hw_module *module,
 
   for (int i = 0; i < isl_vec_size(var->size); ++i)
   {
-    isl_val *v = isl_vec_get_element_val(var->size, i);
+    isl_val *v = isl_vec_get_element_val(var->size, i);    
     long v_i = isl_val_get_num_si(v);
     var_size *= v_i;
     isl_val_free(v);
@@ -2684,30 +2707,54 @@ int extract_memory_type(struct autosa_hw_module *module,
   else
     bram_util = (float)var_size / 512;
 
-  if (module->type == PE_MODULE || (module->type != PE_MODULE && module->level == 1))
-  {
-    if (var->n_lane == 1 && var_size <= 32)
-      use_memory = 0;
+  //if (module->type == PE_MODULE) {
+  //  if (var->n_lane == 1 && var_size <= 32)
+  //    use_memory = 0;
+  //  else
+  //    use_memory = 2;    
+  //} else if (module->type != PE_MODULE && module->level == 1) {
+  //  if (var->n_lane == 1 && var_size <= 32)
+  //    use_memory = 0;
+  //  else {
+  //    //use_memory = 2;
+  //    if (bram_util > 0.2)
+  //      use_memory = 2;
+  //    else
+  //      use_memory = 0;      
+  //  }      
+  //} else {
+  //  if (module->to_mem == 1) {
+  //    if (uram)
+  //      use_memory = 3;
+  //    else
+  //      use_memory = 2;
+  //  } else {
+  //    if (bram_util > 0.2)
+  //      use_memory = 2;
+  //    else
+  //      use_memory = 0;
+  //      //use_memory = 1;        
+  //  }
+  //}
+  
+  if (module->type != PE_MODULE && module->to_mem == 1) {
+    if (uram)
+      use_memory = 3;
     else
       use_memory = 2;
-  }
-  else
-  {
-    if (module->to_mem == 1)
-    {
-      if (uram)
-        use_memory = 3;
+  } else {    
+    if (module->type == IO_MODULE && module->level == 1) {          
+      use_memory = 1;      
+    } else {
+      if (var->n_lane == 1 && var_size <= 32)
+        use_memory = 0;
       else
         use_memory = 2;
-    }
-    else
-    {
-      if (bram_util > 0.2)
-        use_memory = 2;
-      else
-        use_memory = 1;
-    }
-  }
+    }    
+  }  
+
+  if (use_memory == 0) 
+    module->use_FF = 1;
 
   return use_memory;
 }
@@ -2762,6 +2809,11 @@ static cJSON *extract_buffer_info_from_module(struct autosa_gen *gen,
   else
     cJSON_AddStringToObject(buffer, "mem_type", "URAM");
 
+  ///* Array map */
+  //if (module->double_buffer) {
+  //  cJSON_AddStringToObject(buffer, "array_map", "horizontal");
+  //}
+
   return buffer;
 }
 
@@ -2800,6 +2852,13 @@ static cJSON *extract_design_info_from_module(struct autosa_gen *gen,
     cJSON_AddStringToObject(info, "ele_type", array->type);
     cJSON *data_size = cJSON_CreateNumber(array->size);
     cJSON_AddItemToObject(info, "ele_size", data_size);
+
+    /* Mark the module accessing the DRAM */
+    if (module->to_mem) {
+      cJSON_AddNumberToObject(info, "access_mem", 1);
+    } else {
+      cJSON_AddNumberToObject(info, "access_mem", 0);
+    }
   }
   /* Extract the local buffer */
   if (buffer)
@@ -2824,6 +2883,25 @@ static cJSON *extract_design_info_from_module(struct autosa_gen *gen,
     }
     cJSON_AddItemToObject(info, "local_buffers", buffers);
   }
+
+  return info;
+}
+
+static cJSON *extract_design_info_from_serialize_module(struct autosa_gen *gen,
+                                                        struct autosa_hw_module *module, char *module_name)
+{
+  cJSON *info = cJSON_CreateObject();
+  /* Extract the input and output data lanes and width */
+  cJSON *data_pack_inter = cJSON_CreateNumber(module->data_pack_serialize);
+  cJSON *data_pack_intra = cJSON_CreateNumber(module->data_pack_intra);
+  cJSON_AddItemToObject(info, "data_pack_inter", data_pack_inter);
+  cJSON_AddItemToObject(info, "data_pack_intra", data_pack_intra);
+
+  struct autosa_array_ref_group *group = module->io_groups[0];
+  struct autosa_array_info *array = group->array;
+  cJSON_AddStringToObject(info, "ele_type", array->type);
+  cJSON *data_size = cJSON_CreateNumber(array->size);
+  cJSON_AddItemToObject(info, "ele_size", data_size);
 
   return info;
 }
@@ -2935,12 +3013,26 @@ isl_stat sa_extract_design_info(struct autosa_gen *gen)
           p_str = isl_printer_print_str(p_str, "drain");
         }
         p_str = isl_printer_print_str(p_str, "_PE_dummy");
+        if (dummy_module->in) 
+          p_str = isl_printer_print_str(p_str, "_in");
+        else
+          p_str = isl_printer_print_str(p_str, "_out");
         module_name = isl_printer_get_str(p_str);
         isl_printer_free(p_str);
         info = extract_design_info_from_pe_dummy_module(gen, dummy_module, module_name);
         cJSON_AddItemToObject(modules, module_name, info);
         free(module_name);
       }
+    }
+
+    if (module->is_serialized) {
+      if (module->boundary)
+        module_name = concat(ctx, module->name, "boundary_serialize");
+      else
+        module_name = concat(ctx, module->name, "serialize");
+      info = extract_design_info_from_serialize_module(gen, module, module_name);
+      cJSON_AddItemToObject(modules, module_name, info);
+      free(module_name);
     }
   }
 

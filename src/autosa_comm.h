@@ -19,7 +19,9 @@ __isl_give isl_union_map *autosa_io_group_ref_access_relation(
 __isl_give isl_union_map *autosa_array_ref_group_access_relation(
 	struct autosa_array_ref_group *group, int read, int write);	
 __isl_give isl_union_map *autosa_io_group_access_relation(
-  struct autosa_array_ref_group *group, int read, int write);
+  struct autosa_array_ref_group *group, 
+  struct autosa_kernel *kernel,
+  int read, int write);
 __isl_give isl_union_map *autosa_drain_group_ref_access_relation(
   struct autosa_array_ref_group *group,
   struct autosa_stmt_access *ref,
@@ -71,5 +73,6 @@ isl_bool is_io_module_valid(
   __isl_keep isl_schedule_node *node,  
   struct autosa_kernel *kernel, 
   struct autosa_array_ref_group *group, int read);  
+void print_io_grouping_info(FILE *fp, struct autosa_kernel *kernel);
 
 #endif

@@ -75,6 +75,23 @@ extern "C"
 		int non_block_fifo;
 		/* Double buffer coding style. 0: for loop (default) 1: while loop */
 		int double_buffer_style;
+		/* Enable local reduce */
+		int local_reduce;
+		/* Reduce op */
+		char *reduce_op;
+		/* Interior I/O elimination direction. 
+		 * 0: set the first dim to 1 (default). 
+		 * 1: Set the last dim to 1.
+		 */
+		int int_io_dir;
+		/* Lower the interior I/O module L1 buffer */
+		int lower_int_io_L1_buffer;
+		/* Use C++ template in codegen (necessary for irregular PEs) */
+		int use_cplusplus_template;
+		/* Default FIFO depth */
+		int fifo_depth;
+		/* Touch space loops in the SIMD vectorization */
+		int simd_touch_space;
 	};
 
 	struct ppcg_options

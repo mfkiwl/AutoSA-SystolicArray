@@ -30,37 +30,6 @@
 #include "gpu.h"
 #include "util.h"
 
-#ifdef __cplusplus
-extern "C"
-{
-#endif
-
-//#define _DEBUG
-
-#define DBGVAR(os, var)                                  \
-  (os) << "DBG: " << __FILE__ << "(" << __LINE__ << ") " \
-       << #var << " = [" << (var) << "]" << std::endl
-
-#define DBGSCHDNODE(os, node, ctx)                                    {\
-  printf("%s(%d) Print schedule node.\n", __FILE__, __LINE__);         \
-  isl_printer *p_debug = isl_printer_to_file(ctx, os);                 \
-  p_debug = isl_printer_set_yaml_style(p_debug, ISL_YAML_STYLE_BLOCK); \
-  p_debug = isl_printer_print_schedule_node(p_debug, node);            \
-  p_debug = isl_printer_free(p_debug);                                 \
-}
-
-#define DBGSCHD(os, node, ctx)                                        {\
-  printf("%s(%d) Print schedule.\n", __FILE__, __LINE__);              \
-  isl_printer *p_debug = isl_printer_to_file(ctx, os);                 \
-  p_debug = isl_printer_set_yaml_style(p_debug, ISL_YAML_STYLE_BLOCK); \
-  p_debug = isl_printer_print_schedule(p_debug, node);                 \
-  p_debug = isl_printer_free(p_debug);                                 \
-}
-
-#ifdef __cplusplus
-}
-#endif
-
 #ifdef _DEBUG
 #define D(x) x
 #else
@@ -69,6 +38,13 @@ extern "C"
 
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #define max(a, b) (((a) > (b)) ? (a) : (b))
+
+/* If enabled, use the default ISL sink API. */
+#define ISL_SINK
+/* If enabled, the loop tiling factors should be reversed as well. 
+ * The tiled point loops will have a reverse order compared to the original loops.
+ */
+#define REVERSE_ORDER
 
 enum autosa_group_access_type
 {
@@ -193,6 +169,8 @@ struct autosa_kernel_var
   int n_lane;
   /* Array partition factors */
   int n_part;
+  /* Needs initialize */
+  int init_required;
 };
 
 struct autosa_kernel
@@ -308,7 +286,7 @@ struct autosa_kernel
   isl_union_set *domain;
 
   isl_set *host_domain;
-  int single_statement;
+  int single_statement;  
 };
 
 struct autosa_io_info
@@ -317,7 +295,7 @@ struct autosa_io_info
   struct autosa_dep *dep;
   isl_vec *dir;
   /* Old data transfer direction before interior I/O elimination */
-  isl_vec *old_dir;
+  isl_vec *old_dir;  
 };
 
 /* An access to an outer array element or an iterator.
@@ -545,6 +523,7 @@ struct autosa_array_ref_group
   /* I/O schedule */
   isl_schedule *io_schedule;
   isl_schedule *io_L1_schedule;
+  isl_schedule *io_L1_lower_schedule;
   /* Number of I/O levels */
   int io_level;
   /* Dims of space band */
@@ -562,6 +541,8 @@ struct autosa_array_ref_group
   int copy_in;
   /* Does copy-out module exist? */
   int copy_out;
+  /* Attached drain group */
+  struct autosa_array_ref_group *attached_drain_group;  
   /* AutoSA Extended */
 };
 
@@ -571,6 +552,8 @@ struct autosa_array_ref_group_pair
   struct autosa_array_ref_group *io_group;
   struct autosa_array_tile *local_tile; /* Compute the local tile */
   int in_use;
+  isl_map *tagged_access;
+  int simd_depth;
 };
 
 /* Represents an outer array accessed by a autosa_kernel, localized
@@ -712,6 +695,7 @@ struct autosa_pe_dummy_module
   isl_schedule *sched;
   isl_ast_node *tree;
   isl_ast_node *device_tree;
+  int in;
 };
 
 struct autosa_drain_merge_func
@@ -759,6 +743,8 @@ struct autosa_hw_module
   int is_buffer;
   /* Filter module */
   int is_filter;
+  /* Is the DRAM data serialized */
+  int is_serialized;
 
   /* Serialization schedule */
   isl_schedule *serialize_sched;
@@ -799,6 +785,7 @@ struct autosa_hw_module
   /* Data pack factor */
   int data_pack_inter;
   int data_pack_intra;
+  int data_pack_serialize;
 
   /* For I/O module, local array ref index */  
   int n_array_ref;
@@ -808,6 +795,9 @@ struct autosa_hw_module
    * Indicates the loop extent of the memory coalesce loop.
    */
   int coalesce_bound;
+
+  /* The module uses FF to implement arrays. */
+  int use_FF;
 
   struct autosa_kernel *kernel;
 };
@@ -915,13 +905,17 @@ struct autosa_kernel_stmt
     {
       int in;
       int buf;
-      int filter;
+      //int filter;
+      //int lower;
       int boundary;
       int dummy;
       int serialize;
-      char *fifo_name;
+      int reduce;
+      char *in_fifo_name;
+      char *out_fifo_name;
       char *fifo_type;
-      int filter_sched_depth;
+      char *reduce_op;
+      int filter_sched_depth;      
       int filter_param_id;
       int data_pack;
       int reg;
@@ -933,7 +927,8 @@ struct autosa_kernel_stmt
       struct autosa_array_info *array;
       struct autosa_local_array_info *local_array;
       struct autosa_array_ref_group *group;
-      struct autosa_hw_module *module;
+      struct autosa_hw_module *module;      
+      int simd_depth;
     } i;
     struct
     {
@@ -944,6 +939,8 @@ struct autosa_kernel_stmt
       int dummy;
       int upper;
       int lower;
+      int lower_sched_val;
+      int serialize;
       char *module_name;
     } m;
     struct
@@ -980,6 +977,7 @@ struct autosa_node_band_prop
   int *coincident;
   enum autosa_loop_type *pe_opt;
   enum autosa_loop_type *space_time;
+  int *sched_pos;
   int n_member;
   isl_multi_union_pw_aff *mupa;
 };
@@ -1074,7 +1072,9 @@ __isl_give isl_vec *get_dep_dis_at_schedule(__isl_keep isl_basic_map *dep,
                                             __isl_keep isl_schedule *schedule);
 __isl_give isl_vec *get_dep_dis_at_node(__isl_keep isl_basic_map *dep,
                                         __isl_keep isl_schedule_node *band);
-__isl_give isl_schedule *loop_interchange_at_node(
+//__isl_give isl_schedule *loop_interchange_at_node(
+//    __isl_take isl_schedule_node *node, isl_size level1, isl_size level2);
+__isl_give isl_schedule_node *loop_interchange_at_node(
     __isl_take isl_schedule_node *node, isl_size level1, isl_size level2);
 __isl_give isl_schedule_node *get_outermost_permutable_node(
     __isl_keep isl_schedule *schedule);
@@ -1100,16 +1100,27 @@ isl_bool all_parallel_node(__isl_keep isl_schedule_node *node, void *user);
 isl_bool isl_schedule_node_is_io_mark(__isl_keep isl_schedule_node *node, int io_level);
 int is_node_under_simd(__isl_keep isl_schedule_node *node);
 int is_node_under_latency(__isl_keep isl_schedule_node *node);
-int *extract_band_upper_bounds(struct autosa_kernel *kernel,
-                               __isl_keep isl_schedule_node *node);
+int *extract_band_upper_bounds(__isl_keep isl_schedule_node *node);
 __isl_give isl_union_set *set_schedule_eq(
     __isl_keep isl_schedule_node *node, __isl_keep isl_id_list *names);
+__isl_give isl_union_set *set_schedule_neq(
+    __isl_keep isl_schedule_node *node, __isl_keep isl_id_list *names);    
 isl_bool is_flow_dep_carried_by_array_part_loops(__isl_keep isl_schedule *schedule,
                                                  struct autosa_array_ref_group *group, struct autosa_kernel *kernel);
+__isl_give isl_schedule_node *reorder_band_by_dep_dis(__isl_take isl_schedule_node *node);
+__isl_give isl_schedule_node *sched_pos_setup(__isl_take isl_schedule_node *node);
+int get_band_single_schedule_val(__isl_keep isl_schedule_node *node);
+int get_last_sched_dim_val(__isl_keep isl_schedule_node *node);
+__isl_give isl_schedule_node *autosa_atomic_ancestors(__isl_take isl_schedule_node *node);
+int is_dep_carried_by_node(__isl_keep isl_basic_map *dep, __isl_keep isl_schedule_node *node);
+__isl_give isl_schedule_node *autosa_node_sink_to_depth(__isl_take isl_schedule_node *node, int depth);
+__isl_give isl_schedule_node *autosa_node_sink_to_mark(__isl_take isl_schedule_node *node, const char *name);
+int is_marked(__isl_keep isl_schedule_node *node, const char *name);
 
 /* Schedule */
 __isl_give isl_schedule *compute_schedule(struct autosa_gen *gen);
 __isl_give isl_schedule *get_schedule(struct autosa_gen *gen);
+__isl_give isl_schedule *merge_outer_bands(__isl_give isl_schedule *schedule, struct autosa_gen *gen);
 
 /* AutoSA kernel */
 void *autosa_kernel_free(struct autosa_kernel *kernel);

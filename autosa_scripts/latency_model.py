@@ -12,6 +12,7 @@ from scipy.stats.mstats import gmean
 from statistics import mean
 import shutil
 import math
+import argparse
 
 def extract_latency_info(design_dir):
     """ Extract loop information of the design.
@@ -262,7 +263,7 @@ def predict_module_latency_xilinx(loop_struct, config):
         if config['under_coalesce'] == 1:
             config['last_for']['under_coalesce'] = 1
         else:
-            config['last_for']['under_coalesce'] = 0
+            config['last_for']['under_coalesce'] = 0        
         predict_module_latency_xilinx(child, config)
     elif "mark" in loop_struct:
         mark = loop_struct['mark']
@@ -272,40 +273,51 @@ def predict_module_latency_xilinx(loop_struct, config):
             config['under_unroll'] = 1
         if mark_name == 'access_coalesce':
             config['under_coalesce'] = 1
+        if mark_name == 'access_serialize':
+            config['under_serialize'] = 1
         child = mark['child']
         predict_module_latency_xilinx(child, config)
     elif "user" in loop_struct:
         user = loop_struct['user']
         user_expr = user['user_expr']
         config['under_unroll'] = 0
-        config['under_coalesce'] = 0
+        config['under_coalesce'] = 0        
         if config['module_type'] == 1:
             # For outer module, we directly return.
+            config['under_serialize'] = 0
             if config['latency'] == 1:
                 config['latency'] = 0
             return
         
+        #if config['module_name'] == 'A_IO_L2_in':
+        #    print(latency)
         # Set II and depth to 1 by default.
         II = 1
         depth = 1
+        #print(latency, user_expr)
         if user_expr.find('dram') != -1:
             # This is a DRAM stmt, we will plug in the estimated model.
             # Extract the array name
-            module_name = config['module_name']
-            array_name = module_name.split('_')[0]
-            array_info = config['array_info'][array_name]
+            #module_name = config['module_name']
+            #array_name = module_name.split('_')[0]
+            #array_info = config['array_info'][array_name]
 
-            if config['last_for']['under_coalesce'] == 1:
+            if config['last_for']['under_coalesce'] == 1 and \
+               config['under_serialize'] == 0:
                 # This statement accesses the dram under a coalesced loop.
                 burst_len = (config['last_for']['ub'] - config['last_for']['lb'])
                 # The DRAM latency is etimated as 200ns
                 dram_latency = 200 / config['cycle'] + burst_len + depth
                 latency = latency / burst_len * dram_latency
+            elif config['under_serialize'] == 1:
+                # This statement accesses the dram with serialized data.
+                latency = (latency - 1) * II + depth
             else:
                 latency = latency * (200 / config['cycle'] + depth)
         else:
             latency = (latency - 1) * II + depth
-        config['latency'] = latency
+        config['under_serialize'] = 0
+        config['latency'] = latency        
     elif "block" in loop_struct:
         block = loop_struct['block']
         block_child = block['child']
@@ -417,6 +429,8 @@ def predict_module_latency_xilinx(loop_struct, config):
                 config['latency'] = 1
                 predict_module_latency_xilinx(else_block, config)
                 block_latency = max(block_latency, config['latency'])
+        #print('1: ', latency)
+        #print('2: ', block_latency)
         latency = latency * max(block_latency, 1)
         config['latency'] = latency
 
@@ -440,19 +454,33 @@ def predict_design_latency(latency_info, cycle=5, early_stop=-1):
     module_grouped = latency_info['module_grouped']
     array_info = latency_info['array_info']
     loop_infos = latency_info['loop_infos']
+    
+    drain_latency = 0
+    drain_outer = 1
 
-    for module_name in module_grouped:
+    for module_name in module_grouped:        
         if 'dummy' in module_name:
             # Simply skip the dummy module
             continue
+        if module_name not in loop_infos:
+            continue
+
+        ## debug
+        #if module_name != 'A_IO_L2_in':
+        #    continue
+        #print(module_name)
+        ## debug
 
         module = module_grouped[module_name]
+        #print(module)
+
         config['context'] = {}
         config['latency'] = 1
         config['loop_prefix'] = 'Loop'
         config['loop_offset'] = 1
         config['under_unroll'] = 0
         config['under_coalesce'] = 0
+        config['under_serialize'] = 0
         config['under_loop'] = 0
         config['last_for'] = {}
         config['array_info'] = array_info
@@ -461,8 +489,7 @@ def predict_design_latency(latency_info, cycle=5, early_stop=-1):
         config['module_type'] = 0
 
         if 'inter_trans' in module or 'intra_trans' in module:
-            # This is a filter module. We take it as double buffered by default.
-            # TODO: consider when double buffer is disabled.
+            # This is a filter module. We take it as double buffered by default.            
             config['module_type'] = 1
             module_loop_info = loop_infos[module_name]
             predict_module_latency_xilinx(module_loop_info, config)
@@ -490,17 +517,35 @@ def predict_design_latency(latency_info, cycle=5, early_stop=-1):
             predict_module_latency_xilinx(module_loop_info, config)
             intra_trans_latency = config['latency']
 
-            # Note: This is not accurate. 
-            # TODO: Consider the module type
-            module_latency = outer_latency * \
-                (max(inter_trans_latency, intra_trans_latency)) + \
-                 max(inter_trans_latency, intra_trans_latency)
+            ## debug
+            #print(outer_latency)
+            #print(inter_trans_latency)
+            #print(intra_trans_latency)
+            ## debug
+            
+            if module_loop_info['module_prop']['double_buffer'] == 1:
+                module_latency = outer_latency * max(inter_trans_latency, intra_trans_latency)
+                if module_loop_info['module_prop']['in'] == 1:
+                    module_latency += intra_trans_latency
+                else:
+                    module_latency += inter_trans_latency                                    
+            else:
+                module_latency = outer_latency * (inter_trans_latency + intra_trans_latency)            
+            # Hack: For GEMM4
+            #if 'C' in module_name:            
+            if 'drain' in module_name:                                
+                drain_outer = max(1, outer_latency)
 
             latency_all[module_name] = module_latency
         else:
             module_loop_info = loop_infos[module_name]
+            #print(config['module_name'])
             predict_module_latency_xilinx(module_loop_info, config)
-            latency_all[module_name] = config['latency']
+            latency_all[module_name] = config['latency']            
+            # Hack: For GEMM4
+            #if 'C' in module_name:
+            if 'drain' in module_name:
+                drain_latency = max(drain_latency, config['latency'])
 
         # If we set early stop, we are using a baseline latency to compare.
         # If any of the module latency is greater than the baseline, we
@@ -509,9 +554,33 @@ def predict_design_latency(latency_info, cycle=5, early_stop=-1):
             if config['latency'] > early_stop:
                 return config['latency']
 
+    #print(latency_all)
+    drain_last_tile_latency = drain_latency / drain_outer
     latency = 0
     for lat in latency_all:
         if latency_all[lat] > latency:
             latency = latency_all[lat]
+    #print(latency)
+    #print(drain_last_tile_latency)
+    latency += drain_last_tile_latency
 
-    return latency
+    return int(latency)
+
+def unit_test_predict_design_latency(design_dir):
+    """ Unit test for design latency prediction
+
+    Paramters
+    ---------
+    design_dir: str
+        Design directory
+    """
+    latency_info = extract_latency_info(design_dir)
+    latency = predict_design_latency(latency_info, 5)
+    print("latency: ", latency)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="==== AutoSA Latency Model ====")
+    parser.add_argument('-d', required=True, help='design directory')
+
+    args = parser.parse_args()
+    unit_test_predict_design_latency(args.d)

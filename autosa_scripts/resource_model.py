@@ -12,9 +12,11 @@ from scipy.stats.mstats import gmean
 from statistics import mean
 import shutil
 import math
+import pprint
+import argparse
 
 # Helper functions to predict certain modules
-def BRAM_predict_HLS(dw, depth):
+def BRAM_predict_HLS(dw, depth, use_18K=0):
     """ Predict the resource usage of BRAM on Xilinx platforms.  
 
     Parameters
@@ -23,13 +25,16 @@ def BRAM_predict_HLS(dw, depth):
         BRAM port width
     depth: int
         BRAM depth
+    use_18K: int
+        Force the estimator to use the BRAM18K model. (for HLS FIFOs)
     """
-    if dw > 18:
-        alpha = np.ceil(float(dw) / 36)
-        BRAM = alpha * np.ceil(float(depth) / 512)
-    else:
+    if dw <= 18 or use_18K:
         alpha = np.ceil(float(dw) / 18)
-        BRAM = alpha * np.ceil(float(depth) / 1024)
+        BRAM = alpha * np.ceil(float(depth) / 1024)   
+    else:
+        alpha = np.ceil(float(dw) / 36)
+        BRAM = alpha * np.ceil(float(depth) / 512)    
+        
     return BRAM
 
 def URAM_predict_HLS(dw, depth):
@@ -60,6 +65,18 @@ def BRAM_array_predict_HLS(dw, depth, n_part):
     """
     return n_part * BRAM_predict_HLS(dw * 8, np.ceil(float(depth) / n_part))
 
+def FF_array_predict_HLS(dw, depth):
+    """ Predict the FF resource usage of arrays on Xilinx platform.
+
+    Parameters
+    ----------
+    dw: int
+        BRAM port width (in bytes)
+    depth : int
+        BRAM depth
+    """
+    return dw * 8 * depth
+
 def URAM_array_predict_HLS(dw, depth, n_part):
     return n_part * URAM_predict_HLS(dw * 8, np.ceil(float(depth) / n_part))
 
@@ -80,13 +97,38 @@ def FIFO_predict_xilinx(dw, depth):
         FF = 5
         LUT = dw + 12
     else:
-    #    BRAM = BRAM_predict_HLS(dw, depth)
+        BRAM = BRAM_predict_HLS(dw, depth, 1)        
     # In the current codegen, we will use SRL to implement FIFOs
-        BRAM = 0
+    #    BRAM = 0
         FF = dw + 10
         LUT = int(0.9687 * dw + 13.982)
 
     return {'BRAM18K': BRAM, 'DSP': DSP, 'FF': FF, 'LUT': LUT}
+
+def extract_axi_res_from_hls_rpt(rpt_path):
+    """ Extract the resource usage for AXI modules from the HLS report in text format
+
+    Parameters
+    ----------
+    rpt_path: str
+        The path of HLS report
+
+    Returns
+    -------
+    BRAM18K, FF, LUT
+    """
+    with open(rpt_path) as f:
+        lines = f.readlines()
+    BRAM18K_total = 0
+    FF_total = 0
+    LUT_total = 0
+    for line in lines:
+        if line.find('kernel0_gmem_') != -1:
+            line = line.split('|')
+            BRAM18K_total += float(line[3])
+            FF_total += float(line[5])
+            LUT_total += float(line[6])
+    return BRAM18K_total, FF_total, LUT_total
 
 def extract_design_info(design_dir, synth=0):
     """ Extract the design infomation.
@@ -135,17 +177,20 @@ def extract_design_info(design_dir, synth=0):
             fifo_name = line[1]
             fifo_cnt = int(line[2])
             fifo_w = int(line[3])
-            fifo_depth = 2 # default
+            fifo_depth = 2 # default                 
             design_info['fifos'][fifo_name] = {
                 'fifo_cnt': fifo_cnt,
                 'fifo_width': fifo_w,
                 'fifo_depth': fifo_depth
             }
+            if fifo_cnt == 0 and fifo_name in design_info['fifos']:
+                design_info['fifos'].pop(fifo_name)
         elif line[0] == 'module':
             module_name = line[1]
-            module_cnt = int(line[2])
+            module_cnt = int(line[2])                        
             design_info['modules'][module_name]['module_cnt'] = module_cnt
-          
+            if module_cnt == 0 and module_name in design_info['modules']:
+                design_info['modules'].pop(module_name)
     if synth:
         # Load the HLS project              
         hls_rpts = {}
@@ -178,20 +223,35 @@ def extract_design_info(design_dir, synth=0):
             if rpt:
                 res = extract_resource_info_from_hls_rpt(rpt)
                 design_info['modules'][module]['FF'] = res['FF']
+                # Extract the FF storage if existing
+                if "local_buffers" in design_info['modules'][module]:
+                    local_buffers = design_info['modules'][module]['local_buffers']
+                    for local_buffer in local_buffers:
+                        if local_buffer['mem_type'] == 'FF':
+                            design_info['modules'][module]['FF'] -= \
+                                FF_array_predict_HLS(local_buffer['port_width'], \
+                                                     local_buffer['buffer_depth'])                            
                 design_info['modules'][module]['LUT'] = res['LUT']
                 design_info['modules'][module]['BRAM18K'] = res['BRAM18K']
                 design_info['modules'][module]['URAM'] = res['URAM']
                 design_info['modules'][module]['DSP'] = res['DSP']
             else:
                 # For inlined module, its resource usage is included in the parent module.
-                design_info['modules'][module]['FF'] = 0
-                design_info['modules'][module]['LUT'] = 0
-                design_info['modules'][module]['BRAM18K'] = 0
-                design_info['modules'][module]['URAM'] = 0
-                design_info['modules'][module]['DSP'] = 0
+                design_info['modules'][module]['FF'] = None
+                design_info['modules'][module]['LUT'] = None
+                design_info['modules'][module]['BRAM18K'] = None
+                design_info['modules'][module]['URAM'] = None
+                design_info['modules'][module]['DSP'] = None                
         # Top module
         rpt = hls_rpts['kernel']
         res = extract_resource_info_from_hls_rpt(rpt) 
+        # For the top module, we will also parse the report for BRAM usage of AXI modules
+        top_module_rpt_name = 'kernel0_csynth.rpt'
+        axi_bram, axi_ff, axi_lut = extract_axi_res_from_hls_rpt(f'{hls_rpts_dir}/{top_module_rpt_name}')
+        res['BRAM18K'] -= axi_bram
+        res['FF'] -= axi_ff
+        res['LUT'] -= axi_lut
+
         design_info['FF'] = res['FF']
         design_info['LUT'] = res['LUT']
         design_info['BRAM18K'] = res['BRAM18K']
@@ -236,7 +296,7 @@ def extract_resource_info_from_hls_rpt(rpt):
                         res['BRAM18K'] = int(item.text)
                     elif item.tag == 'URAM':
                         res['URAM'] = int(item.text)
-                    elif item.tag == 'DSP':
+                    elif item.tag == 'DSP48E':
                         res['DSP'] = int(item.text)    
                     elif item.tag == 'FF':
                         res['FF'] = int(item.text)   
@@ -411,7 +471,7 @@ def train(df, modules, fifos, design_infos, work_dir, logger):
     pred_set = []
     for module in modules:
         # Expand the dataframe if necessary        
-        df = df_feature_extract(df, module) # TODO
+        df = df_feature_extract(df, module)
         feature_set += get_feature_set(module)        
         pred_set.append(module + '_FF')
         pred_set.append(module + '_LUT')
@@ -422,145 +482,152 @@ def train(df, modules, fifos, design_infos, work_dir, logger):
     X = df.loc[:, feature_set]
     y = df.loc[:, pred_set]
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=0)
+    logger.info(f'#Training samples: {X_train.shape[0]}')
+    logger.info(f'#Validation samples: {X_test.shape[0]}')
 
     # Evaluation metrics
     FF_mape = []
     LUT_mape = []
     DSP_mape = []
     BRAM18K_mape = []
-    URAM_mape = []
-
+    URAM_mape = []    
+    
     for module in modules:
         logger.info('Training resource model for module: ' + module)
         feature_set = get_feature_set(module)
 
         # FF
         pred_set = [module + '_FF']
-        X_train_module = X_train.loc[:, feature_set]
-        X_train_module = X_train_module.dropna()
-        y_train_module = y_train.loc[:, pred_set]
-        y_train_module = y_train_module.dropna()
-
-        model = LinearRegression()
-        model.fit(X_train_module.to_numpy(), y_train_module.to_numpy())
-        model_name = module + '_FF_model'
-        joblib_file = work_dir + '/' + model_name + '.pkl'
-        joblib.dump(model, joblib_file)
+        y_train_module = y_train.loc[:, pred_set]        
+        y_train_module = y_train_module.dropna()        
+        X_train_module = X_train.loc[y_train_module.index, feature_set]                
+        if X_train_module.shape[0] > 0:
+            model = LinearRegression()
+            model.fit(X_train_module.to_numpy(), y_train_module.to_numpy())
+            model_name = module + '_FF_model'
+            joblib_file = work_dir + '/' + model_name + '.pkl'
+            joblib.dump(model, joblib_file)
         # Validate the accuracy
-        X_test_module = X_test.loc[:, feature_set]
-        X_test_module = X_test_module.dropna()
-        y_pred_module = model.predict(X_test_module.to_numpy())
         y_test_module = y_test.loc[:, pred_set]
-        y_test_module = y_test_module.dropna().to_numpy()
-        logger.info('======== FF ========')
-        logger.info(f'Mean Absolute Error: {metrics.mean_absolute_error(y_test_module, y_pred_module)}')
-        logger.info(f'Mean Squared Error: {metrics.mean_squared_error(y_test_module, y_pred_module)}')
-        logger.info(f'Mean Absolute Percentage Error: {mean_absolute_percentage_error(y_test_module, y_pred_module)}')
-        FF_mape.append(mean_absolute_percentage_error(y_test_module, y_pred_module))
+        y_test_module = y_test_module.dropna()
+        X_test_module = X_test.loc[y_test_module.index, feature_set]        
+        if X_test_module.shape[0] > 0:
+            y_pred_module = model.predict(X_test_module.to_numpy())        
+            y_test_module = y_test_module.to_numpy()
+            logger.info('======== FF ========')
+            logger.info(f'Mean Absolute Error: {metrics.mean_absolute_error(y_test_module, y_pred_module)}')
+            logger.info(f'Mean Squared Error: {metrics.mean_squared_error(y_test_module, y_pred_module)}')
+            logger.info(f'Mean Absolute Percentage Error: {mean_absolute_percentage_error(y_test_module, y_pred_module)}')
+            FF_mape.append(mean_absolute_percentage_error(y_test_module, y_pred_module))
 
         # LUT
         pred_set = [module + '_LUT']
-        X_train_module = X_train.loc[:, feature_set]
-        X_train_module = X_train_module.dropna()
         y_train_module = y_train.loc[:, pred_set]
         y_train_module = y_train_module.dropna()
-
-        model = LinearRegression()
-        model.fit(X_train_module.to_numpy(), y_train_module.to_numpy())
-        model_name = module + '_LUT_model'
-        joblib_file = work_dir + '/' + model_name + '.pkl'
-        joblib.dump(model, joblib_file)
+        X_train_module = X_train.loc[y_train_module.index, feature_set]        
+        if X_train_module.shape[0] > 0:
+            model = LinearRegression()
+            model.fit(X_train_module.to_numpy(), y_train_module.to_numpy())
+            model_name = module + '_LUT_model'
+            joblib_file = work_dir + '/' + model_name + '.pkl'
+            joblib.dump(model, joblib_file)
         # Validate the accuracy
-        X_test_module = X_test.loc[:, feature_set]
-        X_test_module = X_test_module.dropna()
-        y_pred_module = model.predict(X_test_module.to_numpy())
         y_test_module = y_test.loc[:, pred_set]
-        y_test_module = y_test_module.dropna().to_numpy()
-        logger.info('======== LUT ========')
-        logger.info(f'Mean Absolute Error: {metrics.mean_absolute_error(y_test_module, y_pred_module)}')
-        logger.info(f'Mean Squared Error: {metrics.mean_squared_error(y_test_module, y_pred_module)}')
-        logger.info(f'Mean Absolute Percentage Error: {mean_absolute_percentage_error(y_test_module, y_pred_module)}')
-        LUT_mape.append(mean_absolute_percentage_error(y_test_module, y_pred_module))
+        y_test_module = y_test_module.dropna()
+        X_test_module = X_test.loc[y_test_module.index, feature_set]        
+        if X_test_module.shape[0] > 0:
+            y_pred_module = model.predict(X_test_module.to_numpy())        
+            y_test_module = y_test_module.to_numpy()
+            logger.info('======== LUT ========')
+            logger.info(f'Mean Absolute Error: {metrics.mean_absolute_error(y_test_module, y_pred_module)}')
+            logger.info(f'Mean Squared Error: {metrics.mean_squared_error(y_test_module, y_pred_module)}')
+            logger.info(f'Mean Absolute Percentage Error: {mean_absolute_percentage_error(y_test_module, y_pred_module)}')
+            LUT_mape.append(mean_absolute_percentage_error(y_test_module, y_pred_module))
 
         # DSP
         pred_set = [module + '_DSP']
-        X_train_module = X_train.loc[:, feature_set]
-        X_train_module = X_train_module.dropna()
         y_train_module = y_train.loc[:, pred_set]
         y_train_module = y_train_module.dropna()
-
-        model = LinearRegression()
-        model.fit(X_train_module.to_numpy(), y_train_module.to_numpy())
-        model_name = module + '_DSP_model'
-        joblib_file = work_dir + '/' + model_name + '.pkl'
-        joblib.dump(model, joblib_file)
+        X_train_module = X_train.loc[y_train_module.index, feature_set]
+        if X_train_module.shape[0] > 0:
+            model = LinearRegression()
+            model.fit(X_train_module.to_numpy(), y_train_module.to_numpy())
+            model_name = module + '_DSP_model'
+            joblib_file = work_dir + '/' + model_name + '.pkl'
+            joblib.dump(model, joblib_file)
         # Validate the accuracy
-        X_test_module = X_test.loc[:, feature_set]
-        X_test_module = X_test_module.dropna()
-        y_pred_module = model.predict(X_test_module.to_numpy())
         y_test_module = y_test.loc[:, pred_set]
-        y_test_module = y_test_module.dropna().to_numpy()
-        logger.info('======== DSP ========')
-        logger.info(f'Mean Absolute Error: {metrics.mean_absolute_error(y_test_module, y_pred_module)}')
-        logger.info(f'Mean Squared Error: {metrics.mean_squared_error(y_test_module, y_pred_module)}')
-        logger.info(f'Mean Absolute Percentage Error: {mean_absolute_percentage_error(y_test_module, y_pred_module)}')
-        DSP_mape.append(mean_absolute_percentage_error(y_test_module, y_pred_module))
+        y_test_module = y_test_module.dropna()
+        X_test_module = X_test.loc[y_test_module.index, feature_set]        
+        if X_test_module.shape[0] > 0:
+            y_pred_module = model.predict(X_test_module.to_numpy())        
+            y_test_module = y_test_module.to_numpy()        
+            logger.info('======== DSP ========')
+            logger.info(f'Mean Absolute Error: {metrics.mean_absolute_error(y_test_module, y_pred_module)}')
+            logger.info(f'Mean Squared Error: {metrics.mean_squared_error(y_test_module, y_pred_module)}')
+            logger.info(f'Mean Absolute Percentage Error: {mean_absolute_percentage_error(y_test_module, y_pred_module)}')
+            DSP_mape.append(mean_absolute_percentage_error(y_test_module, y_pred_module))
 
         # BRAM18K
         pred_set = [module + '_BRAM18K']
-        X_test_module = X_test.loc[:, feature_set]
-        X_test_module = X_test_module.dropna()        
         y_test_module = y_test.loc[:, pred_set]        
         y_test_module = y_test_module.dropna()
-        y_pred_module = np.zeros((y_test_module.shape[0], 1), dtype=float)
-        cnt = 0
-        for index, row in y_test_module.iterrows():
-            design = 'design' + str(index)
-            design_info = design_infos[index]
-            BRAM_usage = 0
-            if "local_buffers" in design_info['modules'][module]:
-                local_buffers = design_info['modules'][module]['local_buffers']
-                for local_buffer in local_buffers:
-                    if local_buffer['mem_type'] == 'BRAM':
-                        BRAM_usage += BRAM_array_predict_HLS(local_buffer['port_width'], \
-                            local_buffer['buffer_depth'], local_buffer['partition_number'])
-            y_pred_module[cnt] = BRAM_usage
-            cnt += 1
+        X_test_module = X_test.loc[y_test_module.index, feature_set]        
+        if X_test_module.shape[0] > 0:
+            y_pred_module = np.zeros((y_test_module.shape[0], 1), dtype=float)
+            cnt = 0
+            for index, row in y_test_module.iterrows():            
+                design_info = design_infos[index]
+                BRAM_usage = 0
+                if "local_buffers" in design_info['modules'][module]:
+                    local_buffers = design_info['modules'][module]['local_buffers']
+                    for local_buffer in local_buffers:
+                        if local_buffer['mem_type'] == 'BRAM':
+                            if 'array_map' in local_buffer:
+                                # For horizontal mapping, we will merge two ping/pong buffers to one
+                                BRAM_usage += BRAM_array_predict_HLS(local_buffer['port_width'], \
+                                    local_buffer['buffer_depth'] * 2, local_buffer['partition_number']) / 2
+                            else:
+                                BRAM_usage += BRAM_array_predict_HLS(local_buffer['port_width'], \
+                                    local_buffer['buffer_depth'], local_buffer['partition_number'])                                  
 
-        y_test_module = y_test_module.to_numpy()
-        logger.info('======== BRAM18K ========')
-        logger.info(f'Mean Absolute Error: {metrics.mean_absolute_error(y_test_module, y_pred_module)}')
-        logger.info(f'Mean Squared Error: {metrics.mean_squared_error(y_test_module, y_pred_module)}')
-        logger.info(f'Mean Absolute Percentage Error: {mean_absolute_percentage_error(y_test_module, y_pred_module)}')
-        BRAM18K_mape.append(mean_absolute_percentage_error(y_test_module, y_pred_module))
+                y_pred_module[cnt] = BRAM_usage
+                cnt += 1
+
+            y_test_module = y_test_module.to_numpy()
+            logger.info('======== BRAM18K ========')
+            logger.info(f'Mean Absolute Error: {metrics.mean_absolute_error(y_test_module, y_pred_module)}')
+            logger.info(f'Mean Squared Error: {metrics.mean_squared_error(y_test_module, y_pred_module)}')
+            logger.info(f'Mean Absolute Percentage Error: {mean_absolute_percentage_error(y_test_module, y_pred_module)}')
+            BRAM18K_mape.append(mean_absolute_percentage_error(y_test_module, y_pred_module))
 
         # URAM
         pred_set = [module + '_URAM']
-        X_test_module = X_test.loc[:, feature_set]
-        X_test_module = X_test_module.dropna()        
         y_test_module = y_test.loc[:, pred_set]        
         y_test_module = y_test_module.dropna()
-        y_pred_module = np.zeros((y_test_module.shape[0], 1), dtype=float)
-        cnt = 0
-        for index, row in y_test_module.iterrows():
-            design = 'design' + str(index)
-            design_info = design_infos[index]
-            URAM_usage = 0
-            if "local_buffers" in design_info['modules'][module]:
-                local_buffers = design_info['modules'][module]['local_buffers']
-                for local_buffer in local_buffers:
-                    if local_buffer['mem_type'] == 'URAM':
-                        BRAM_usage += URAM_array_predict_HLS(local_buffer['port_width'], \
-                            local_buffer['buffer_depth'], local_buffer['partition_number'])
-            y_pred_module[cnt] = URAM_usage
-            cnt += 1
+        X_test_module = X_test.loc[y_test_module.index, feature_set]     
+        if X_test_module.shape[0] > 0:           
+            y_pred_module = np.zeros((y_test_module.shape[0], 1), dtype=float)
+            cnt = 0
+            for index, row in y_test_module.iterrows():
+                design = 'design' + str(index)
+                design_info = design_infos[index]
+                URAM_usage = 0
+                if "local_buffers" in design_info['modules'][module]:
+                    local_buffers = design_info['modules'][module]['local_buffers']
+                    for local_buffer in local_buffers:
+                        if local_buffer['mem_type'] == 'URAM':
+                            BRAM_usage += URAM_array_predict_HLS(local_buffer['port_width'], \
+                                local_buffer['buffer_depth'], local_buffer['partition_number'])
+                y_pred_module[cnt] = URAM_usage
+                cnt += 1
 
-        y_test_module = y_test_module.to_numpy()
-        logger.info('======== URAM ========')
-        logger.info(f'Mean Absolute Error: {metrics.mean_absolute_error(y_test_module, y_pred_module)}')
-        logger.info(f'Mean Squared Error: {metrics.mean_squared_error(y_test_module, y_pred_module)}')
-        logger.info(f'Mean Absolute Percentage Error: {mean_absolute_percentage_error(y_test_module, y_pred_module)}')
-        URAM_mape.append(mean_absolute_percentage_error(y_test_module, y_pred_module))
+            y_test_module = y_test_module.to_numpy()
+            logger.info('======== URAM ========')
+            logger.info(f'Mean Absolute Error: {metrics.mean_absolute_error(y_test_module, y_pred_module)}')
+            logger.info(f'Mean Squared Error: {metrics.mean_squared_error(y_test_module, y_pred_module)}')
+            logger.info(f'Mean Absolute Percentage Error: {mean_absolute_percentage_error(y_test_module, y_pred_module)}')
+            URAM_mape.append(mean_absolute_percentage_error(y_test_module, y_pred_module))
         
     logger.info('======== Module-Level Resource Model Validation Results ========')
     logger.info('FF Mean Absoulate Percentage Error (Arith. Mean): %.2f%%' %(mean(FF_mape)))
@@ -578,22 +645,27 @@ def train(df, modules, fifos, design_infos, work_dir, logger):
     URAM_design_mape = []
 
     for index, row in df_test.iterrows():
+        #print(index)
         design_info = design_infos[index]
         df_design = df_test.loc[[index], :]
-        res = predict_design_resource_usage(df_design, modules, fifos, design_info, work_dir) 
-    
-        FF_mape = mean_absolute_percentage_error(design_info['FF'], res['FF'].item())        
-        LUT_mape = mean_absolute_percentage_error(design_info['LUT'], res['LUT'].item())
-        DSP_mape = mean_absolute_percentage_error(design_info['DSP'], res['DSP'].item())        
-        BRAM18K_mape = mean_absolute_percentage_error(design_info['BRAM18K'], res['BRAM18K'])
-        URAM_mape = mean_absolute_percentage_error(design_info['URAM'], res['URAM'])
+        res = predict_design_resource_usage(df_design, modules, fifos, design_info, work_dir)                 
+
+        #print(design_info['BRAM18K'], res['BRAM18K'])
+        #print(design_info['FF'], res['FF'])
+        #print(design_info['LUT'], res['LUT'])
+
+        FF_mape = mean_absolute_percentage_error(float(design_info['FF']), res['FF'])        
+        LUT_mape = mean_absolute_percentage_error(float(design_info['LUT']), res['LUT'])
+        DSP_mape = mean_absolute_percentage_error(float(design_info['DSP']), res['DSP'])        
+        BRAM18K_mape = mean_absolute_percentage_error(float(design_info['BRAM18K']), res['BRAM18K'])
+        URAM_mape = mean_absolute_percentage_error(float(design_info['URAM']), res['URAM'])
 
         FF_design_mape.append(FF_mape)
         LUT_design_mape.append(LUT_mape)
         DSP_design_mape.append(DSP_mape)
         BRAM18K_design_mape.append(BRAM18K_mape)
         URAM_design_mape.append(URAM_mape)
-    
+
     logger.info('======== Design-Level Resource Model Validation Results ========')
     logger.info('FF Mean Absoulate Percentage Error (Arith. Mean): %.2f%%' %(mean(FF_design_mape)))
     logger.info('LUT Mean Absoulate Percentage Error (Arith. Mean): %.2f%%' %(mean(LUT_design_mape)))
@@ -602,7 +674,7 @@ def train(df, modules, fifos, design_infos, work_dir, logger):
     logger.info('URAM Mean Absoulate Percentage Error (Arith. Mean): %.2f%%' %(mean(URAM_design_mape)))    
 
 def predict_design_resource_usage(df, modules, fifos, design_info, prj_dir, \
-    target=['FF', 'LUT', 'DSP', 'BRAM18K', 'DSP']):
+    target=['FF', 'LUT', 'DSP', 'BRAM18K', 'URAM']):
     """ Predict the resource usage for a single design on Xilinx platforms
 
     Parameters
@@ -651,17 +723,25 @@ def predict_design_resource_usage(df, modules, fifos, design_info, prj_dir, \
                 X = df.loc[:, module_feature_set]
                 model_name = module + '_FF_model'
                 joblib_file = prj_dir + '/' + model_name + '.pkl'
-                model = joblib.load(joblib_file)
-                FF = np.asscalar(model.predict(X.to_numpy()))
-
+                if os.path.isfile(joblib_file):
+                    model = joblib.load(joblib_file)
+                    FF = np.asscalar(model.predict(X.to_numpy()))
+                    # Add back the FF arrays if existing
+                    if "local_buffers" in design_info['modules'][module]:
+                        local_buffers = design_info['modules'][module]['local_buffers']
+                        for local_buffer in local_buffers:
+                            if local_buffer['mem_type'] == 'FF':
+                                FF += FF_array_predict_HLS(local_buffer['port_width'], \
+                                                           local_buffer['buffer_depth'])
             LUT = 0
             if 'LUT' in target:
                 # LUT
                 X = df.loc[:, module_feature_set]
                 model_name = module + '_LUT_model'
                 joblib_file = prj_dir + '/' + model_name + '.pkl'
-                model = joblib.load(joblib_file)
-                LUT = np.asscalar(model.predict(X.to_numpy()))
+                if os.path.isfile(joblib_file):
+                    model = joblib.load(joblib_file)
+                    LUT = np.asscalar(model.predict(X.to_numpy()))
 
             DSP = 0
             if 'DSP' in target:
@@ -669,8 +749,9 @@ def predict_design_resource_usage(df, modules, fifos, design_info, prj_dir, \
                 X = df.loc[:, module_feature_set]
                 model_name = module + '_DSP_model'
                 joblib_file = prj_dir + '/' + model_name + '.pkl'
-                model = joblib.load(joblib_file)
-                DSP = np.asscalar(model.predict(X.to_numpy()))
+                if os.path.isfile(joblib_file):
+                    model = joblib.load(joblib_file)
+                    DSP = np.asscalar(model.predict(X.to_numpy()))
 
             BRAM = 0
             if 'BRAM18K' in target:
@@ -679,8 +760,16 @@ def predict_design_resource_usage(df, modules, fifos, design_info, prj_dir, \
                     local_buffers = design_info['modules'][module]['local_buffers']
                     for local_buffer in local_buffers:
                         if local_buffer['mem_type'] == 'BRAM':
-                            BRAM += BRAM_array_predict_HLS(local_buffer['port_width'], \
-                                local_buffer['buffer_depth'], local_buffer['partition_number'])
+                            if 'array_map' in local_buffer:
+                                # For horizontal mapping, we will merge two ping/pong buffers to one
+                                BRAM += BRAM_array_predict_HLS(local_buffer['port_width'], \
+                                    local_buffer['buffer_depth'] * 2, local_buffer['partition_number']) / 2
+                            else:
+                                BRAM += BRAM_array_predict_HLS(local_buffer['port_width'], \
+                                    local_buffer['buffer_depth'], local_buffer['partition_number'])                            
+
+            #if BRAM > 0:
+            #    print(module, BRAM)
 
             URAM = 0
             if 'URAM' in target:
@@ -694,28 +783,44 @@ def predict_design_resource_usage(df, modules, fifos, design_info, prj_dir, \
 
             resource_all[module] = {
                 'FF': FF, 'LUT': LUT, 'BRAM18K': BRAM, 'URAM': URAM, 'DSP': DSP, \
-                'n': design_info['modules'][module]['module_cnt']}
+                'n': design_info['modules'][module]['module_cnt']}        
+
+    #pp = pprint.PrettyPrinter(indent=4)
+    #pp.pprint(resource_all)
 
     # Aggregate the resource
     for inst in resource_all:
         # For FF/LUT/DSP prediction, if the module contains inner module, skip it.
-        is_outer_module = 0
-        if inst.find('boundary') != -1:
-            if inst[:-9] + '_inter_trans' in resource_all:
-                is_outer_module = 1
-        else:
-            if inst + '_inter_trans' in resource_all:
-                is_outer_module = 1
-        if not is_outer_module:
-            resource['FF'] += resource_all[inst]['FF'] * resource_all[inst]['n']
-            resource['LUT'] += resource_all[inst]['LUT'] * resource_all[inst]['n']
-            resource['DSP'] += resource_all[inst]['DSP'] * resource_all[inst]['n']
+        #is_outer_module = 0
+        #if inst.find('boundary') != -1:
+        #    if inst[:-9] + '_inter_trans' in resource_all:
+        #        is_outer_module = 1
+        #else:
+        #    if inst + '_inter_trans' in resource_all:
+        #        is_outer_module = 1
+        is_inner_module = 0
+        if inst.find('inter_trans') != -1 or inst.find('intra_trans') != -1:
+            is_inner_module = 1
+        #if not is_outer_module:
+        #    resource['FF'] += resource_all[inst]['FF'] * resource_all[inst]['n']
+        #    resource['LUT'] += resource_all[inst]['LUT'] * resource_all[inst]['n']
+        #    resource['DSP'] += resource_all[inst]['DSP'] * resource_all[inst]['n']
+        if is_inner_module:
+            continue
+
+        resource['FF'] += resource_all[inst]['FF'] * resource_all[inst]['n']
+        resource['LUT'] += resource_all[inst]['LUT'] * resource_all[inst]['n']
+        resource['DSP'] += resource_all[inst]['DSP'] * resource_all[inst]['n']
         resource['BRAM18K'] += resource_all[inst]['BRAM18K'] * resource_all[inst]['n']
         resource['URAM'] += resource_all[inst]['URAM'] * resource_all[inst]['n']
 
     ret = {}
-    for r in target:
-        ret[r] = resource[r]
+    for r in resource:
+        if r in target:
+            ret[r] = int(resource[r])
+        else:
+            ret[r] = 0
+
     return ret
 
 def mean_absolute_percentage_error(y_true, y_pred):    
@@ -726,10 +831,10 @@ def mean_absolute_percentage_error(y_true, y_pred):
         # scalar
         if y_true == 0:
             return abs(y_pred) * 100
-        else:
-            return abs((y_true - y_pred) // y_true) * 100
+        else:            
+            return abs((y_true - y_pred) / y_true) * 100
 
-def resource_valid(res, hw_info, range):
+def resource_valid(res, hw_info, range, target):
     """ Test if the resource usage is valid.
 
     Parameters
@@ -740,17 +845,20 @@ def resource_valid(res, hw_info, range):
         A dict containing the hardware platform information.
     thres: dict
         A dict containing the resource threshold.
+    target: list
+        A list containing the hw resource target to predict.
 
     Returns
     -------
     ret: boolean
     """
     for r in res:
-        usage = res[r]
-        if usage > hw_info[r] * range[r][1]:
-            return False
-        if usage < hw_info[r] * range[r][0]:
-            return False
+        if r in target:
+            usage = res[r]
+            if usage > hw_info[r] * range[r][1]:
+                return False
+            if usage < hw_info[r] * range[r][0]:
+                return False
     return True
 
 def compute_res_util_score(res, hw_info):
@@ -763,14 +871,39 @@ def compute_res_util_score(res, hw_info):
     """
     score = 0
     if 'FF' in res:
-        score += 0.1 * float(res['FF']) / hw_info['FF']
+        score += 0.1 * float(int(res['FF'])) / hw_info['FF']
     if 'LUT' in res:
-        score += 0.2 * float(res['LUT']) / hw_info['LUT']
+        score += 0.2 * float(int(res['LUT'])) / hw_info['LUT']
     if 'BRAM18K' in res:
-        score += 0.3 * float(res['BRAM18K']) / hw_info['BRAM18K']
+        score += 0.3 * float(int(res['BRAM18K'])) / hw_info['BRAM18K']
     if 'DSP' in res:
-        score += 0.3 * float(res['DSP']) / hw_info['DSP']
+        score += 0.3 * float(int(res['DSP'])) / hw_info['DSP']
     if 'URAM' in res:
-        score += 0.3 * float(res['URAM']) / hw_info['URAM']
+        score += 0.3 * float(int(res['URAM'])) / hw_info['URAM']
 
     return score
+
+def unit_test_predict_design_resource(design_dir, hw_info, model_path):
+    design_info = extract_design_info(design_dir, 0)
+    modules, fifos, df = convert_design_infos_to_df([design_info])
+    kernel_id = design_info['kernel_id']        
+    res_model_path = f'{model_path}/kernel{kernel_id}'
+    res = predict_design_resource_usage(
+        df, modules, fifos, design_info,
+        res_model_path)
+    # compute the ratio
+    print(f"FF: {res['FF']}/{hw_info['FF']} ({res['FF']/hw_info['FF']:.2f})")
+    print(f"LUT: {res['LUT']}/{hw_info['LUT']} ({res['LUT']/hw_info['LUT']:.2f})")
+    print(f"BRAM18K: {res['BRAM18K']}/{hw_info['BRAM18K']} ({res['BRAM18K']/hw_info['BRAM18K']:.2f})")
+    print(f"DSP: {res['DSP']}/{hw_info['DSP']} ({res['DSP']/hw_info['DSP']:.2f})")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="==== AutoSA Resource Model ====")
+    parser.add_argument('-d', required=True, help='design directory')
+    parser.add_argument('-i', required=True, help='hardware info')
+    parser.add_argument('-m', required=True, help='resource model path')
+
+    args = parser.parse_args()
+    with open(args.i, 'r') as f:
+        hw_info = json.load(f)
+    unit_test_predict_design_resource(args.d, hw_info, args.m)
