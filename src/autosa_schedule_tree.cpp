@@ -379,6 +379,8 @@ isl_bool is_dep_uniform_wrap(__isl_keep isl_map *map, void *user)
 isl_bool uniform_dep_check(__isl_keep isl_schedule *schedule, struct ppcg_scop *scop)
 {
   isl_union_map *dep_rar = scop->dep_rar;
+  //DBGUMAP(stdout, dep_rar, isl_schedule_get_ctx(schedule));
+
   isl_union_map *dep_flow = scop->dep_flow;
 
   isl_bool all_flow_dep_uniform = isl_union_map_every_map(dep_flow, &is_dep_uniform_wrap, schedule);
@@ -1256,6 +1258,14 @@ static __isl_give isl_schedule_node *delete_inserted_mark(__isl_take isl_schedul
   return node;
 }
 
+static isl_bool has_band_node(__isl_keep isl_schedule_node *node, void *user)
+{
+  if (isl_schedule_node_get_type(node) == isl_schedule_node_band)    
+    return isl_bool_false;
+  
+  return isl_bool_true;
+}
+
 /* Insert the node at the "depth" position. To prevent inserting the node 
  * multiple times, a "inserted" mark will be inserted before the node.
  * After the insertion, we will delete this "inserted" mark.
@@ -1370,15 +1380,60 @@ static __isl_give isl_schedule_node *sink_node_to_mark(
   isl_id *id;
   isl_schedule_node *node_tmp;  
 
-  if (isl_schedule_node_get_type(node) != isl_schedule_node_band)
-    return node;
+  //if (isl_schedule_node_get_type(node) != isl_schedule_node_band)
+  //  return node;
   
   /* Examine the subtree contains the "inserted" mark node */
   if (!isl_schedule_node_every_descendant(node, &has_inserted_mark, NULL)) {    
     return node;
   }
 
-  node = isl_schedule_node_child(node, 0);
+  //DBGSCHDNODE(stdout, node, isl_schedule_node_get_ctx(node));
+
+  if (isl_schedule_node_get_type(node) == isl_schedule_node_band) {
+    /* If this is a band node, then insert it under the band node. */
+    node = isl_schedule_node_child(node, 0);
+  } else if (isl_schedule_node_get_type(node) == isl_schedule_node_leaf) {
+    /* If this is a leaf node, check:
+     * 1. There is a band node in the parent tree.
+     * 2. There is a sequence node, and there is no bands under any children.
+     * If the above criteria meet, we will skip this node because we will insert the node in the other positions. 
+     */    
+    bool insert = 1;
+    node_tmp = isl_schedule_node_copy(node);
+    //DBGSCHDNODE(stdout, node_tmp, isl_schedule_node_get_ctx(node_tmp));
+    while (!autosa_tree_node_is_mark(node_tmp, "stop") && isl_schedule_node_has_parent(node_tmp)) {
+      node_tmp = isl_schedule_node_parent(node_tmp);
+      if (isl_schedule_node_get_type(node_tmp) == isl_schedule_node_band) {
+        insert = 0;        
+        break;
+      }
+      if (isl_schedule_node_get_type(node_tmp) == isl_schedule_node_sequence) {
+        // TODO: We haven't considered other nodes such as set yet.
+        int n_child = 0;
+        for (n_child = 0; n_child < isl_schedule_node_n_children(node_tmp); n_child++) {
+          isl_schedule_node *node_child = isl_schedule_node_child(isl_schedule_node_copy(node_tmp), n_child);
+          /* Check if there is any band node under this child node. */
+          if (!isl_schedule_node_every_descendant(node_child, &has_band_node, NULL)) {                        
+            isl_schedule_node_free(node_child);
+            break;
+          }          
+          isl_schedule_node_free(node_child);
+        }
+        if (n_child == isl_schedule_node_n_children(node_tmp)) {
+          insert = 0;          
+          break;
+        }        
+      } 
+    }    
+    isl_schedule_node_free(node_tmp);
+    if (insert == 0)
+      return node;
+  } else {
+    return node;
+  }
+
+  //node = isl_schedule_node_child(node, 0);
   /* Check if the node is under any exisiting "name" node.
    * If true, move the node to the mark node.
    */
@@ -1426,10 +1481,16 @@ __isl_give isl_schedule_node *autosa_node_sink_to_mark(
 {
   isl_multi_union_pw_aff *mupa;
   struct autosa_node_band_prop *prop;
+  isl_id *id;
 
   if (isl_schedule_node_get_type(node) != isl_schedule_node_band)
     return node;
-  
+
+  /* Insert a stop mark. */
+  id = isl_id_alloc(isl_schedule_node_get_ctx(node), "stop", NULL);
+  node = isl_schedule_node_insert_mark(node, id);
+  node = isl_schedule_node_child(node, 0);
+
   mupa = isl_schedule_node_band_get_partial_schedule(node);
   prop = extract_node_band_prop(node);
   /* Delete the current node */
@@ -1438,7 +1499,7 @@ __isl_give isl_schedule_node *autosa_node_sink_to_mark(
   struct sink_node_to_mark_data data = {mupa, prop, name, false};
   node = isl_schedule_node_map_descendant_bottom_up(node, &sink_node_to_mark, &data);
   if (!data.inserted) {
-    isl_id *id;
+    
     /* Insert the node at current position */
     node = isl_schedule_node_insert_partial_schedule(node, isl_multi_union_pw_aff_copy(data.mupa));
     node = isl_schedule_node_band_set_permutable(node, data.prop->permutable);
@@ -1456,6 +1517,10 @@ __isl_give isl_schedule_node *autosa_node_sink_to_mark(
   /* Delete the "inserted" mark */
   node = isl_schedule_node_map_descendant_bottom_up(node, &delete_inserted_mark, NULL);
   
+  /* Delete the stop mark */
+  node = isl_schedule_node_parent(node);
+  node = isl_schedule_node_delete(node);
+
   autosa_node_band_prop_free(prop);
   isl_multi_union_pw_aff_free(mupa);
 
@@ -1920,9 +1985,17 @@ static __isl_give isl_schedule_constraints *construct_schedule_constraints(
   }
   else
   {
+//#ifdef _DEBUG
+//    std::cout << "FLOW DEPs" << std::endl;
+//    DBGUMAP(stdout, prog->scop->dep_flow, isl_union_map_get_ctx(prog->scop->dep_flow));    
+//    std::cout << "FALSE DEPs" << std::endl;
+//    DBGUMAP(stdout, prog->scop->dep_false, isl_union_map_get_ctx(prog->scop->dep_false));
+//    std::cout << "RAR DEPs" << std::endl;
+//    DBGUMAP(stdout, prog->scop->dep_rar, isl_union_map_get_ctx(prog->scop->dep_rar));
+//#endif
     dep_raw = isl_union_map_copy(prog->scop->dep_flow);
     dep = isl_union_map_copy(prog->scop->dep_false);
-    dep = isl_union_map_union(dep, dep_raw);
+    dep = isl_union_map_union(dep, dep_raw);    
     dep = isl_union_map_coalesce(dep);
     proximity = isl_union_map_copy(dep);
     coincidence = isl_union_map_copy(dep);
@@ -2627,7 +2700,7 @@ int autosa_tree_node_is_kernel(__isl_keep isl_schedule_node *node)
 
 /* Is "node" a mark node with an identifier called "mark"?
  */
-int autosa_tree_node_is_mark(__isl_keep isl_schedule_node *node, char *mark)
+int autosa_tree_node_is_mark(__isl_keep isl_schedule_node *node, const char *mark)
 {
   if (mark == NULL)
     return (isl_schedule_node_get_type(node) == isl_schedule_node_mark);

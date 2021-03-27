@@ -16,27 +16,27 @@ int main(int argc, char **argv) {
   for (int i = 0; i < I; i++) 
     for (int k = 0; k < K; k++) {
 #ifdef LAYOUT2      
-      A[i][k] = k;
+      A[i][k] = (data_t)rand() / RAND_MAX;
 #endif
 #ifdef LAYOUT3      
-      A[k][i] = k;
+      A[k][i] = (data_t)rand() / RAND_MAX;
 #endif      
     }
 
   for (int j = 0; j < J; j++)
     for (int k = 0; k < K; k++) {
 #ifdef LAYOUT2      
-      B[j][k] = k;
+      B[j][k] = (data_t)rand() / RAND_MAX;
 #endif
 #ifdef LAYOUT3      
-      B[k][j] = k;
+      B[k][j] = (data_t)rand() / RAND_MAX;
 #endif      
     }
 
 #pragma scop
   for (int i = 0; i < I; i++)
     for (int j = 0; j < J; j++) {
-//      C[i][j] = 0;
+      C[i][j] = 0;
       for (int k = 0; k < K; k++) {
 #ifdef LAYOUT2        
         C[i][j] = C[i][j] + A[i][k] * B[j][k];

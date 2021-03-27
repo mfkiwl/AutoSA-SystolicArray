@@ -545,14 +545,23 @@ struct autosa_kernel **sa_space_time_transform(__isl_take isl_schedule *schedule
     struct autosa_kernel **sa_list = NULL;
     isl_size n_sa = 0;
 
+//#ifdef _DEBUG
+//    DBGSCHD(stdout, schedule, isl_schedule_get_ctx(schedule));
+//#endif
     isl_schedule_node *band = get_outermost_permutable_node(schedule);
     isl_size band_w = isl_schedule_node_band_n_member(band);
+    if (band_w <= 0) {
+        isl_schedule_free(schedule);
+        *num_sa = 0;
+        return NULL;
+    }
+
     /* Explore 1D systolic array */
     if (scop->options->autosa->max_sa_dim >= 1 && band_w >= 1)
     {
         if (scop->options->autosa->verbose)
         {
-            printf("AutoSA] Explore 1D systolic array.\n");
+            printf("[AutoSA] Explore 1D systolic array.\n");
         }
         isl_size n_sa_dim = 0;
         struct autosa_kernel **sa_dim_list = sa_space_time_transform_at_dim(
@@ -917,6 +926,13 @@ static struct autosa_kernel *autosa_kernel_create_local_arrays(
         kernel->array[i].n_mem_ports = 0;
         kernel->array[i].host_serialize = 0;
         kernel->array[i].serialize_bound = NULL;
+        /* Initiaze the sparse information */
+        kernel->array[i].is_sparse = 0;
+        kernel->array[i].vec_len = 0;
+        kernel->array[i].n_nzero = 0;
+        kernel->array[i].compress_ratio = 0.0f;
+        kernel->array[i].n_meta_data = 0;
+        kernel->array[i].eff_compress_ratio = 0.0f;
     }
 
     return kernel;
@@ -1062,7 +1078,6 @@ static isl_stat sa_io_update(struct autosa_kernel *sa)
                 local_array->array_type = AUTOSA_EXT_ARRAY;
                 opt_data.is_update = isl_bool_false;
             }
-
             opt_data.dep_type = AUTOSA_DEP_RAW;
             isl_union_map_every_map(dep_flow, &data_transfer_update_wrap, &opt_data);
             if (opt_data.is_update == isl_bool_true)
@@ -1070,7 +1085,6 @@ static isl_stat sa_io_update(struct autosa_kernel *sa)
                 local_array->array_type = AUTOSA_INT_ARRAY;
                 opt_data.is_update = isl_bool_false;
             }
-
             opt_data.dep_type = AUTOSA_DEP_WAW;
             isl_union_map_every_map(dep_waw, &data_transfer_update_wrap, &opt_data);
         }
@@ -1657,14 +1671,21 @@ __isl_give isl_schedule_node *autosa_latency_node_band_sink_time(
 {
     if (sa->type == AUTOSA_SA_TYPE_ASYNC)
     {
-#ifdef ISL_SINK        
-        node = isl_schedule_node_band_sink(node);
-        /* Add the "latency" mark. */
-        node = isl_schedule_node_map_descendant_bottom_up(
-            node, &add_latency_mark, NULL);
-#else            
-        node = autosa_node_sink_to_mark(node, "latency");
-#endif
+//#ifdef ISL_SINK      
+        if (sa->options->autosa->isl_sink) {
+            node = isl_schedule_node_band_sink(node);
+            /* Add the "latency" mark. */
+            node = isl_schedule_node_map_descendant_bottom_up(
+                node, &add_latency_mark, NULL);
+
+        } 
+//#else   
+        else {
+            //DBGSCHDNODE(stdout, node, isl_schedule_node_get_ctx(node));
+            node = autosa_node_sink_to_mark(node, "latency");
+            //DBGSCHDNODE(stdout, node, isl_schedule_node_get_ctx(node));            
+        }
+//#endif
     }
     else if (sa->type == AUTOSA_SA_TYPE_SYNC)
     {
@@ -1727,20 +1748,35 @@ static __isl_give isl_schedule_node *autosa_latency_tile_band_loop(
     int n;
     isl_id *id;
     n = isl_schedule_node_band_n_member(node);
+    int i;
+    int reverse_visit = 0;
 
-#ifndef REVERSE_ORDER    
-    for (int i = 0; i < n; i++)
-#else    
-    for (int i = n - 1; i >= 0; i--)
-#endif    
-    {
+//#ifndef REVERSE_ORDER    
+//    for (int i = 0; i < n; i++)
+//#else    
+//    for (int i = n - 1; i >= 0; i--)
+//#endif    
+    if ((data->sa->options->autosa->reverse_order && !data->sa->options->autosa->isl_sink) ||
+       (!data->sa->options->autosa->reverse_order && data->sa->options->autosa->isl_sink)) {
+        i = 0;
+        reverse_visit = 0;
+    } else {
+        i = n - 1;
+        reverse_visit = 1;
+    }
+    while (1)
+    {        
         if (isl_schedule_node_band_member_get_pe_opt(node, i) == autosa_loop_latency)
         {
-#ifdef REVERSE_ORDER
-            int loop_tile_size = data->tile_size[data->tile_len - data->n_touched_loop - 1];            
-#else
-            int loop_tile_size = data->tile_size[data->n_touched_loop];
-#endif            
+            int loop_tile_size;
+//#ifdef REVERSE_ORDER
+            if (reverse_visit) {
+                loop_tile_size = data->tile_size[data->tile_len - data->n_touched_loop - 1];            
+//#else
+            } else {
+                loop_tile_size = data->tile_size[data->n_touched_loop];
+            }
+//#endif            
             (data->n_touched_loop)++;
             /* If latency hiding is applied on the space loops, we need to update
              * the SA dimensions. 
@@ -1785,6 +1821,15 @@ static __isl_give isl_schedule_node *autosa_latency_tile_band_loop(
                 /* Reset the pe_opt property */
                 node = isl_schedule_node_band_member_set_pe_opt(node, i, autosa_loop_default);
             }
+        }
+        if (reverse_visit) {
+            if (i == 0)
+                break;
+            i--;
+        } else {
+            if (i == n - 1)
+                break;
+            i++;
         }
     }
 
@@ -2031,7 +2076,7 @@ isl_stat sa_latency_hiding_optimize(struct autosa_kernel *sa, bool en, char *mod
     schedule = isl_schedule_map_schedule_node_bottom_up(
         schedule, &clear_pe_opt_prop, NULL);
 
-    sa->schedule = schedule;
+    sa->schedule = schedule;    
 
     return isl_stat_ok;
 }
@@ -2052,6 +2097,7 @@ struct simd_vectorization_data
     char *buffer;
     int buffer_offset;
     int has_space_candidate;
+    int n_legal_loops;
 };
 
 /* Internal struct used in is_stride_coalesced. */
@@ -2449,6 +2495,8 @@ static isl_schedule_node *detect_simd_vectorization_loop(
                         data->scores[data->n_loops - 1] = score;
                         data->legal = (int *)realloc(data->legal, sizeof(int) * data->n_loops);
                         data->legal[data->n_loops - 1] = !layout_transform;
+                        if (!layout_transform) 
+                            data->n_legal_loops++;
 
                         /* Extract the loop upper bounds */
                         int *ubs = extract_band_upper_bounds(node);
@@ -2652,14 +2700,18 @@ static __isl_give isl_schedule_node *autosa_simd_tile_loop(
                 /* Reset the point loop pe_opt property to default. */
                 node = isl_schedule_node_band_member_set_pe_opt(node, 0, autosa_loop_default);                
                 /* Sink the point loop innermost */
-#ifdef ISL_SINK                
-                node = isl_schedule_node_band_sink(node);
-                /* Add the simd marker */
-                node = isl_schedule_node_map_descendant_bottom_up(node, &add_simd_mark, NULL);
-#else                
-                /* Sink the point loop innermost and add the simd marker */
-                node = autosa_node_sink_to_mark(node, "simd");
-#endif
+//#ifdef ISL_SINK                
+                if (kernel->options->autosa->isl_sink) {
+                    node = isl_schedule_node_band_sink(node);
+                    /* Add the simd marker */
+                    node = isl_schedule_node_map_descendant_bottom_up(node, &add_simd_mark, NULL);
+                }
+//#else                
+                else {
+                    /* Sink the point loop innermost and add the simd marker */
+                    node = autosa_node_sink_to_mark(node, "simd");
+                }
+//#endif
                 /* Update the stride information for array references under the SIMD loop. */
                 isl_schedule_node_every_descendant(node, &update_simd_acc, &stride_data);                
 
@@ -2776,6 +2828,7 @@ isl_stat sa_simd_vectorization_optimize(struct autosa_kernel *sa, char *mode)
     data.buffer = NULL;
     data.buffer_offset = 0;
     data.n_loops = n_loops;
+    data.n_legal_loops = 0;
     data.has_space_candidate = 0;
     /* Load the SIMD information. */
     data.buffer = load_simd_info(sa);
@@ -2802,9 +2855,12 @@ isl_stat sa_simd_vectorization_optimize(struct autosa_kernel *sa, char *mode)
     }
     isl_schedule_free(schedule);
 
-    if (data.layout_trans)
-    {
-        printf("[AutoSA] Warning: Layout transformation is required to proceed. SIMD vectorization is skipped.\n");
+    //if (data.layout_trans)
+    //{
+    //    printf("[AutoSA] Warning: Layout transformation is required to proceed. SIMD vectorization is skipped.\n");
+    //}
+    if (data.n_legal_loops == 0) {
+        printf("[AutoSA] No legal SIMD loop is fonud. SIMD vectorization is skipped.\n");
     }
     else
     {
@@ -3283,6 +3339,12 @@ static __isl_give isl_schedule_node *compute_and_comm_optimize(
     sa_candidates = sa_space_time_transform(schedule, gen->prog->scop, &num_sa);
     if (num_sa > 0)
         printf("[AutoSA] %d systolic arrays generated.\n", num_sa);
+    else
+    {
+        printf("[AutoSA] No systolic array generated. Exit now.\n");
+        exit(0);
+    }
+    
     space_time_json = cJSON_GetObjectItemCaseSensitive(gen->tuning_config, "space_time");
     space_time_mode_json = cJSON_GetObjectItemCaseSensitive(space_time_json, "mode");
     space_time_mode = space_time_mode_json->valuestring;    
@@ -3336,16 +3398,17 @@ static __isl_give isl_schedule_node *compute_and_comm_optimize(
         }
     }
 
-//#ifdef _DEBUG
-//    DBGSCHD(stdout, kernel->schedule, isl_schedule_get_ctx(kernel->schedule))    
-//#endif
-
     kernel->prog = gen->prog;
-    kernel->options = gen->options;
+    kernel->options = gen->options;    
 
     /* Create local arrays. */
     kernel = autosa_kernel_create_local_arrays(kernel, gen->prog);
     assert(kernel != NULL);
+
+    /* Update the sparse structures */
+    if (gen->options->autosa->block_sparse) {
+        autosa_kernel_extract_sparse_info(kernel, gen);
+    }
 
     /* Apply PE optimization. */
     array_part_json = cJSON_GetObjectItemCaseSensitive(gen->tuning_config, "array_part");
@@ -4000,12 +4063,12 @@ static __isl_give isl_printer *generate(__isl_take isl_printer *p,
 //    DBGSCHD(stdout, schedule, gen->ctx);
 //#endif
 
-    /* Hack: If we disable reschedule, we will try another time
-     * here to merge some of the schedule bands. 
-     */
-    if (!gen->options->reschedule) {
-        schedule = merge_outer_bands(schedule, gen);
-    }
+    /* The current ISL scheduler is limited and sometimes can't find the 
+     * fully permutable loop band correctly.
+     * As a temporary hack, here we will try a second time and to merge the 
+     * outer band as much as possible.
+     */    
+    schedule = merge_outer_bands(schedule, gen);    
 
 //#ifdef _DEBUG
 //    DBGSCHD(stdout, schedule, gen->ctx);
@@ -4069,7 +4132,7 @@ static __isl_give isl_printer *generate(__isl_take isl_printer *p,
         sa_extract_design_info(gen);
 
         /* Code generation */
-        p = ppcg_set_macro_names(p);
+        //p = ppcg_set_macro_names(p);
         p = ppcg_print_exposed_declarations(p, prog->scop);
         p = gen->print(p, gen->prog, gen->tree, gen->hw_modules, gen->n_hw_modules,
                        gen->hw_top_module, gen->drain_merge_funcs, gen->n_drain_merge_funcs,
