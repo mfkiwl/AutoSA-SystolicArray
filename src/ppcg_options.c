@@ -11,14 +11,15 @@
 #include "ppcg_options.h"
 
 static struct isl_arg_choice target[] = {
-	{"c", PPCG_TARGET_C},
-	{"cuda", PPCG_TARGET_CUDA},
-	{"opencl", PPCG_TARGET_OPENCL},
-	{"autosa_c", AUTOSA_TARGET_C},
+	//{"c", PPCG_TARGET_C},
+	//{"cuda", PPCG_TARGET_CUDA},
+	//{"opencl", PPCG_TARGET_OPENCL},
+	//{"autosa_c", AUTOSA_TARGET_C},
 	{"autosa_hls_c", AUTOSA_TARGET_XILINX_HLS_C},
 	{"autosa_opencl", AUTOSA_TARGET_INTEL_OPENCL},
-	{"autosa_t2s", AUTOSA_TARGET_T2S},
+	//{"autosa_t2s", AUTOSA_TARGET_T2S},
 	{"autosa_catapult_c", AUTOSA_TARGET_CATAPULT_HLS_C},
+	{"autosa_tapa", AUTOSA_TARGET_TAPA_CPP},
 	{0}};
 
 static struct isl_arg_choice sa_type[] = {
@@ -69,20 +70,20 @@ ISL_ARG_BOOL(struct ppcg_debug_options, dump_sizes, 0,
 ISL_ARG_BOOL(struct ppcg_debug_options, verbose, 'v', "verbose", 0, NULL)
 ISL_ARGS_END
 
-ISL_ARGS_START(struct ppcg_options, ppcg_opencl_options_args)
-ISL_ARG_STR(struct ppcg_options, opencl_compiler_options, 0, "compiler-options",
-			"options", NULL, "options to pass to the OpenCL compiler")
-ISL_ARG_BOOL(struct ppcg_options, opencl_use_gpu, 0, "use-gpu", 1,
-			 "use GPU device (if available)")
-ISL_ARG_STR_LIST(struct ppcg_options, opencl_n_include_file,
-				 opencl_include_files, 0, "include-file", "filename",
-				 "file to #include in generated OpenCL code")
-ISL_ARG_BOOL(struct ppcg_options, opencl_print_kernel_types, 0,
-			 "print-kernel-types", 1,
-			 "print definitions of types in the kernel file")
-ISL_ARG_BOOL(struct ppcg_options, opencl_embed_kernel_code, 0,
-			 "embed-kernel-code", 0, "embed kernel code into host code")
-ISL_ARGS_END
+//ISL_ARGS_START(struct ppcg_options, ppcg_opencl_options_args)
+//ISL_ARG_STR(struct ppcg_options, opencl_compiler_options, 0, "compiler-options",
+//			"options", NULL, "options to pass to the OpenCL compiler")
+//ISL_ARG_BOOL(struct ppcg_options, opencl_use_gpu, 0, "use-gpu", 1,
+//			 "use GPU device (if available)")
+//ISL_ARG_STR_LIST(struct ppcg_options, opencl_n_include_file,
+//				 opencl_include_files, 0, "include-file", "filename",
+//				 "file to #include in generated OpenCL code")
+//ISL_ARG_BOOL(struct ppcg_options, opencl_print_kernel_types, 0,
+//			 "print-kernel-types", 1,
+//			 "print definitions of types in the kernel file")
+//ISL_ARG_BOOL(struct ppcg_options, opencl_embed_kernel_code, 0,
+//			 "embed-kernel-code", 0, "embed kernel code into host code")
+//ISL_ARGS_END
 
 ISL_ARGS_START(struct autosa_options, autosa_options_args)
 ISL_ARG_BOOL(struct autosa_options, autosa, 0, "autosa", 1,
@@ -105,8 +106,16 @@ ISL_ARG_STR(struct autosa_options, data_pack_sizes, 0, "data-pack-sizes", "sizes
 				NULL, "data pack sizes upper bound (bytes) at innermost, intermediate, outermost I/O level [default: kernel[]->data_pack[8,32,64]]")
 ISL_ARG_BOOL(struct autosa_options, double_buffer, 0, "double-buffer", 1,
 			 	"enable double-buffering for data transfer")
+ISL_ARG_STR(struct autosa_options, double_buffer_assignment, 0, "double-buffer-assign", "assignment",
+				NULL, "assign arrays to be double bufferred (e.g., kernel[]->A[])")
 ISL_ARG_INT(struct autosa_options, double_buffer_style, 0, "double-buffer-style", "id", 1,
 				"change double-buffering logic coding style (0: while loop 1: for loop)")
+ISL_ARG_BOOL(struct autosa_options, dump_code, 0, "dump-code", 0,
+			 	"dump the intermediate code")
+ISL_ARG_BOOL(struct autosa_options, explore_loop_permute, 0, "explore-loop-permute", 0,
+				"explore loop permutation in the step of array partitioning")
+ISL_ARG_INT(struct autosa_options, loop_permute_order, 0, "loop-permute-order", "order", 0,
+				"specify which loop ordering to be explored")
 ISL_ARG_INT(struct autosa_options, fifo_depth, 0, "fifo-depth", "depth", 2, "default FIFO depth")
 ISL_ARG_BOOL(struct autosa_options, hbm, 0, "hbm", 0,
 			 	"use multi-port DRAM/HBM")
@@ -132,6 +141,8 @@ ISL_ARG_STR(struct autosa_options, reduce_op, 0, "reduce-op", "op",
 				NULL, "reduction operator (must be used with local-reduce together)")			 
 ISL_ARG_BOOL(struct autosa_options, lower_int_io_L1_buffer, 0, "lower-int-io-L1-buffer", 0,
 			 	"lower the L1 buffer for interior I/O modules")
+ISL_ARG_BOOL(struct autosa_options, lower_if_branch, 0, "lower-if-branch", 0,
+				"lower if branch in the I/O module")
 ISL_ARG_INT(struct autosa_options, max_local_memory, 0,
 				"max-local-memory", "size", 8192, "maximal amount of local memory")
 ISL_ARG_INT(struct autosa_options, max_sa_dim, 0,
@@ -143,7 +154,9 @@ ISL_ARG_BOOL(struct autosa_options, non_block_fifo, 0, "non-blocking-fifo", 0,
 ISL_ARG_STR(struct autosa_options, output_dir, 0, "output-dir", "dir", "./autosa.tmp/output",
 				"AutoSA Output directory")
 ISL_ARG_BOOL(struct autosa_options, reverse_order, 0, "reverse-order", 1,
-			 	"reverse loop tiling order")				
+			 	"reverse latency hiding loop tiling order")			
+ISL_ARG_STR(struct autosa_options, select_rar_dep, 0, "select-rar-dep", "choice",
+				NULL, "select the RAR dependence for the array access. [example: kernel[]->__pet_ref_4[1]]")
 ISL_ARG_STR(struct autosa_options, sa_sizes, 0, "sa-sizes", "sizes", NULL,
 				"per kernel PE optimization tile sizes")
 ISL_ARG_INT(struct autosa_options, sa_tile_size, 0, "sa-tile-size", "size", 4,
@@ -154,12 +167,16 @@ ISL_ARG_STR(struct autosa_options, simd_info, 0, "simd-info", "info", NULL,
 				"per kernel SIMD information")
 ISL_ARG_BOOL(struct autosa_options, simd_touch_space, 0, "simd-touch-space", 0,
 				"use space loops as SIMD vectorization loops")
+ISL_ARG_INT(struct autosa_options, tuning_method, 0, "tuning-method", "method", -1,
+				"tuning method (0: exhaustive search 1: others)")
 ISL_ARG_BOOL(struct autosa_options, two_level_buffer, 0, "two-level-buffer", 0,
 			 	"enable two-level buffering in I/O modules")
 ISL_ARG_BOOL(struct autosa_options, t2s_tile, 0, "t2s-tile", 0,
 			 	"generate T2S code from tiled code")
 ISL_ARG_INT(struct autosa_options, t2s_tile_phase, 0,
 				"t2s-tile-phase", "phase", 0, "T2S tiled URE codegen phase")
+ISL_ARG_STR(struct autosa_options, param_names, 0, "param-names", "name", NULL,
+				"customized parameter names (for tuning)")
 ISL_ARG_BOOL(struct autosa_options, uram, 0, "uram", 0,
 			 	"use Xilinx FPGA URAM")
 ISL_ARG_BOOL(struct autosa_options, use_local_memory, 0, "local-memory", 1,
@@ -178,58 +195,58 @@ ISL_ARG_CHILD(struct ppcg_options, debug, NULL, &ppcg_debug_options_args,
 			  "debugging options")
 ISL_ARG_CHILD(struct ppcg_options, autosa, "autosa", &autosa_options_args,
 			  "AutoSA options")
-ISL_ARG_BOOL(struct ppcg_options, group_chains, 0, "group-chains", 1,
-			 "group chains of interdependent statements that are executed "
-			 "consecutively in the original schedule before scheduling")
+//ISL_ARG_BOOL(struct ppcg_options, group_chains, 0, "group-chains", 1,
+//			 "group chains of interdependent statements that are executed "
+//			 "consecutively in the original schedule before scheduling")
 ISL_ARG_BOOL(struct ppcg_options, reschedule, 0, "reschedule", 1,
 			 "replace original schedule by isl computed schedule")
-ISL_ARG_BOOL(struct ppcg_options, scale_tile_loops, 0,
-			 "scale-tile-loops", 1, NULL)
-ISL_ARG_BOOL(struct ppcg_options, wrap, 0, "wrap", 1, NULL)
-ISL_ARG_BOOL(struct ppcg_options, use_shared_memory, 0, "shared-memory", 1,
-			 "use shared memory in kernel code")
-ISL_ARG_BOOL(struct ppcg_options, use_private_memory, 0, "private-memory", 1,
-			 "use private memory in kernel code")
-ISL_ARG_STR(struct ppcg_options, ctx, 0, "ctx", "context", NULL,
-			"Constraints on parameters")
-ISL_ARG_BOOL(struct ppcg_options, non_negative_parameters, 0,
-			 "assume-non-negative-parameters", 0,
-			 "assume all parameters are non-negative)")
-ISL_ARG_BOOL(struct ppcg_options, tile, 0, "tile", 0,
-			 "perform tiling (C target)")
-ISL_ARG_INT(struct ppcg_options, tile_size, 'S', "tile-size", "size", 32, NULL)
-ISL_ARG_BOOL(struct ppcg_options, isolate_full_tiles, 0, "isolate-full-tiles",
-			 0, "isolate full tiles from partial tiles (hybrid tiling)")
-ISL_ARG_STR(struct ppcg_options, sizes, 0, "sizes", "sizes", NULL,
-			"Per kernel tile, grid and block sizes")
-ISL_ARG_INT(struct ppcg_options, max_shared_memory, 0,
-			"max-shared-memory", "size", 8192, "maximal amount of shared memory")
-ISL_ARG_BOOL(struct ppcg_options, openmp, 0, "openmp", 0,
-			 "Generate OpenMP macros (only for C target)")
+//ISL_ARG_BOOL(struct ppcg_options, scale_tile_loops, 0,
+//			 "scale-tile-loops", 1, NULL)
+//ISL_ARG_BOOL(struct ppcg_options, wrap, 0, "wrap", 1, NULL)
+//ISL_ARG_BOOL(struct ppcg_options, use_shared_memory, 0, "shared-memory", 1,
+//			 "use shared memory in kernel code")
+//ISL_ARG_BOOL(struct ppcg_options, use_private_memory, 0, "private-memory", 1,
+//			 "use private memory in kernel code")
+//ISL_ARG_STR(struct ppcg_options, ctx, 0, "ctx", "context", NULL,
+//			"Constraints on parameters")
+//ISL_ARG_BOOL(struct ppcg_options, non_negative_parameters, 0,
+//			 "assume-non-negative-parameters", 0,
+//			 "assume all parameters are non-negative)")
+//ISL_ARG_BOOL(struct ppcg_options, tile, 0, "tile", 0,
+//			 "perform tiling (C target)")
+//ISL_ARG_INT(struct ppcg_options, tile_size, 'S', "tile-size", "size", 32, NULL)
+//ISL_ARG_BOOL(struct ppcg_options, isolate_full_tiles, 0, "isolate-full-tiles",
+//			 0, "isolate full tiles from partial tiles (hybrid tiling)")
+//ISL_ARG_STR(struct ppcg_options, sizes, 0, "sizes", "sizes", NULL,
+//			"Per kernel tile, grid and block sizes")
+//ISL_ARG_INT(struct ppcg_options, max_shared_memory, 0,
+//			"max-shared-memory", "size", 8192, "maximal amount of shared memory")
+//ISL_ARG_BOOL(struct ppcg_options, openmp, 0, "openmp", 0,
+//			 "Generate OpenMP macros (only for C target)")
 ISL_ARG_USER_OPT_CHOICE(struct ppcg_options, target, 0, "target", target,
 						&set_target, PPCG_TARGET_CUDA, PPCG_TARGET_CUDA,
 						"the target to generate code for")
 ISL_ARG_BOOL(struct ppcg_options, linearize_device_arrays, 0,
 			 "linearize-device-arrays", 1,
 			 "linearize all device arrays, even those of fixed size")
-ISL_ARG_BOOL(struct ppcg_options, allow_gnu_extensions, 0,
-			 "allow-gnu-extensions", 1,
-			 "allow the use of GNU extensions in generated code")
+//ISL_ARG_BOOL(struct ppcg_options, allow_gnu_extensions, 0,
+//			 "allow-gnu-extensions", 1,
+//			 "allow the use of GNU extensions in generated code")
 ISL_ARG_BOOL(struct ppcg_options, live_range_reordering, 0,
-			 "live-range-reordering", 1,
+			 "live-range-reordering", 0,
 			 "allow successive live ranges on the same memory element "
 			 "to be reordered")
-ISL_ARG_BOOL(struct ppcg_options, hybrid, 0, "hybrid", 0,
-			 "apply hybrid tiling whenever a suitable input pattern is found "
-			 "(GPU targets)")
-ISL_ARG_BOOL(struct ppcg_options, unroll_copy_shared, 0, "unroll-copy-shared",
-			 0, "unroll code for copying to/from shared memory")
-ISL_ARG_BOOL(struct ppcg_options, unroll_gpu_tile, 0, "unroll-gpu-tile", 0,
-			 "unroll code inside tile on GPU targets")
-ISL_ARG_GROUP("opencl", &ppcg_opencl_options_args, "OpenCL options")
-ISL_ARG_STR(struct ppcg_options, save_schedule_file, 0, "save-schedule",
-			"file", NULL, "save isl computed schedule to <file>")
-ISL_ARG_STR(struct ppcg_options, load_schedule_file, 0, "load-schedule",
-			"file", NULL, "load schedule from <file>, "
-						  "using it instead of an isl computed schedule")
+//ISL_ARG_BOOL(struct ppcg_options, hybrid, 0, "hybrid", 0,
+//			 "apply hybrid tiling whenever a suitable input pattern is found "
+//			 "(GPU targets)")
+//ISL_ARG_BOOL(struct ppcg_options, unroll_copy_shared, 0, "unroll-copy-shared",
+//			 0, "unroll code for copying to/from shared memory")
+//ISL_ARG_BOOL(struct ppcg_options, unroll_gpu_tile, 0, "unroll-gpu-tile", 0,
+//			 "unroll code inside tile on GPU targets")
+//ISL_ARG_GROUP("opencl", &ppcg_opencl_options_args, "OpenCL options")
+//ISL_ARG_STR(struct ppcg_options, save_schedule_file, 0, "save-schedule",
+//			"file", NULL, "save isl computed schedule to <file>")
+//ISL_ARG_STR(struct ppcg_options, load_schedule_file, 0, "load-schedule",
+//			"file", NULL, "load schedule from <file>, "
+//						  "using it instead of an isl computed schedule")
 ISL_ARGS_END

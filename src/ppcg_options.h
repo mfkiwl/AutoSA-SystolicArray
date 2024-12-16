@@ -27,6 +27,10 @@ extern "C"
 		int n_hbm_port;
 		/* Enable double buffering. */
 		int double_buffer;
+		/* Double buffer assignment. */
+		char *double_buffer_assignment;
+		/* Dump the intermediate code. */
+		int dump_code;
 		/* Maximal systolic array dimension. */
 		int max_sa_dim;
 		/* Systolic array type. */
@@ -85,6 +89,8 @@ extern "C"
 		 * 0: set the first dim to 1 (default). 
 		 * 1: Set the last dim to 1.
 		 */
+		/* Select the RAR dependence candidate. */
+		char *select_rar_dep;
 		int int_io_dir;
 		/* Lower the interior I/O module L1 buffer */
 		int lower_int_io_L1_buffer;
@@ -108,6 +114,15 @@ extern "C"
 		int reverse_order;
 		/* Use AXI Stream Interface. */
 		int axi_stream;
+		/* Tuning method: [0: Exhaustive search 1: Others] */
+		int tuning_method;
+		/* Explore loop permutation in the array partitioning. */
+		int explore_loop_permute;
+		int loop_permute_order;
+		/* Parameter names */
+		char *param_names;
+		/* Lowering if-branch in inter-trans I/O module. */
+		int lower_if_branch;
 	};	
 
 	struct ppcg_options
@@ -201,6 +216,7 @@ extern "C"
 #define AUTOSA_TARGET_T2S 5
 #define AUTOSA_TARGET_C 6
 #define AUTOSA_TARGET_CATAPULT_HLS_C 7
+#define AUTOSA_TARGET_TAPA_CPP 8
 
 #define AUTOSA_SA_TYPE_SYNC 0
 #define AUTOSA_SA_TYPE_ASYNC 1

@@ -107,8 +107,9 @@ static int populate_array_references_pe(struct autosa_local_array_info *local,
 
     map = isl_map_from_union_map(umap);
     map = isl_map_detect_equalities(map);
-
-    group = isl_calloc_type(ctx, struct autosa_array_ref_group);
+    
+    group = new autosa_array_ref_group;
+    group = autosa_array_ref_group_init(group);
     if (!group)
     {
       isl_map_free(map);
@@ -133,6 +134,8 @@ static int populate_array_references_pe(struct autosa_local_array_info *local,
     group->io_buffers = NULL;
     group->copy_schedule = NULL;
     group->pe_tile = NULL;
+    group->tuning_refs.push_back(std::shared_ptr<TPArrayRef>(local->array->tuning_refs[i]));
+    group->tuning_pe_tile = NULL;
 
     groups[n++] = group;
   }
@@ -155,7 +158,9 @@ static struct autosa_array_ref_group *join_groups(
     return NULL;
 
   ctx = isl_map_get_ctx(group1->access);
-  group = isl_calloc_type(ctx, struct autosa_array_ref_group);
+  //group = isl_calloc_type(ctx, struct autosa_array_ref_group);
+  group = new autosa_array_ref_group;
+  group = autosa_array_ref_group_init(group);
   if (!group)
     return NULL;
   group->local_array = group1->local_array;
@@ -175,8 +180,10 @@ static struct autosa_array_ref_group *join_groups(
                                 group->n_ref);
   if (!group->refs)                                     
     return autosa_array_ref_group_free(group);
-  for (i = 0; i < group1->n_ref; ++i)
+  for (i = 0; i < group1->n_ref; ++i) {
     group->refs[i] = group1->refs[i];
+    group->tuning_refs.push_back(std::shared_ptr<TPArrayRef>(group1->tuning_refs[i]));
+  }
   /* Compare if the refs equals */      
   for (i = 0; i < group2->n_ref; ++i) {
     struct autosa_stmt_access *ref = group2->refs[i];
@@ -190,9 +197,9 @@ static struct autosa_array_ref_group *join_groups(
     if (!found) {
       group->n_ref++;
       group->refs = (struct autosa_stmt_access **)realloc(group->refs,
-                        group->n_ref * sizeof(struct autosa_stmt_access *));
-      //group->refs[group1->n_ref + i] = group2->refs[i];
+                        group->n_ref * sizeof(struct autosa_stmt_access *));      
       group->refs[group->n_ref - 1] = group2->refs[i];
+      group->tuning_refs.push_back(std::shared_ptr<TPArrayRef>(group2->tuning_refs[i]));
     }
   }
 
@@ -207,6 +214,12 @@ static struct autosa_array_ref_group *join_groups(
   group->n_io_buffer = group1->n_io_buffer;
   group->io_buffers = group1->io_buffers;
   group->n_mem_ports = group1->n_mem_ports;
+  group->local_tile = NULL;
+  group->pe_tile = NULL;
+  /* Merge the tuning refs */
+  for (auto ref : group1->tuning_refs) {
+    group->tuning_refs.push_back(std::shared_ptr<TPArrayRef>(ref));
+  }
 
   return group;
 }
@@ -220,7 +233,7 @@ static struct autosa_array_ref_group *join_groups_and_free(
 {
   struct autosa_array_ref_group *group;
 
-  group = join_groups(group1, group2);
+  group = join_groups(group1, group2);  
   autosa_array_ref_group_free(group1);
   autosa_array_ref_group_free(group2);
   return group;
@@ -252,7 +265,7 @@ static int group_array_references_default(struct autosa_kernel *kernel,
   isl_schedule_node *node;
 
   groups = isl_calloc_array(ctx, struct autosa_array_ref_group *,
-                            local->array->n_ref);
+                            local->array->n_ref);  
   if (!groups)
     return -1;
 
@@ -282,7 +295,7 @@ static int group_array_references_default(struct autosa_kernel *kernel,
   {
     /* Join all referneces together. */
     for (int i = 1; i < n; ++i)
-    {
+    {      
       groups[0] = join_groups_and_free(groups[0], groups[i]);
     }
     n = 1;
@@ -681,13 +694,15 @@ static isl_stat compute_group_bounds_core_pe(struct autosa_kernel *kernel,
     isl_schedule_node *node;        
     contract_data.legal = false;
     contract_data.prefix = NULL;
+    contract_data.prefix_upma = NULL;
 
     /* Create a tile. */
     group->local_tile = autosa_array_tile_create(ctx,
                                                  group->array->n_index);
 
     /* Check if array contraction is possible. */
-    if (kernel->options->autosa->local_reduce && kernel->options->autosa->array_contraction) {      
+    if ((kernel->options->autosa->local_reduce && kernel->options->autosa->array_contraction) ||
+       (kernel->options->autosa->tuning_method == 1 && kernel->options->autosa->array_contraction)) {      
       contract_data.group = group;
       contract_data.kernel = kernel;
       contract_data.legal = true;
@@ -695,16 +710,13 @@ static isl_stat compute_group_bounds_core_pe(struct autosa_kernel *kernel,
       contract_data.prefix_upma = NULL;
       contract_data.depth = -1;      
       node = isl_schedule_get_root(kernel->schedule);
-      node = autosa_tree_move_down_to_pe(node, kernel->core);
-      //DBGSCHDNODE(stdout, node, isl_schedule_node_get_ctx(node));
+      node = autosa_tree_move_down_to_pe(node, kernel->core);      
       node = isl_schedule_node_map_descendant_bottom_up(node, &check_contraction, &contract_data);
       isl_schedule_node_free(node);      
-      //std::cout << contract_data.legal << std::endl;
-      //std::cout << contract_data.depth << std::endl;
     }
     
     if (contract_data.legal) {
-      /* We are able to create a register tiling. */
+      /* We are able to create a register tiling. */      
       acc = isl_map_from_union_map(isl_union_map_apply_domain(isl_union_map_copy(access), 
                                                               isl_union_map_copy(contract_data.prefix)));
       group->copy_schedule_dim = contract_data.depth;
@@ -712,8 +724,14 @@ static isl_stat compute_group_bounds_core_pe(struct autosa_kernel *kernel,
       group->copy_schedule = isl_union_pw_multi_aff_pullback_union_pw_multi_aff(group->copy_schedule,
                                                                                 isl_union_pw_multi_aff_copy(kernel->contraction));
     } else {
+      isl_union_pw_multi_aff_free(contract_data.prefix_upma);
       /* Map the domain to the outer scheduling dimensions */
-      acc = local_access_pe(group, access, data);
+      acc = local_access_pe(group, access, data);  
+      node = isl_schedule_get_root(kernel->schedule);
+      node = autosa_tree_move_down_to_pe(node, kernel->core);
+      if (kernel->options->autosa->tuning_method == 1)
+        group->tuning_local_tile = TP_infer_tiled_array(data->gen, kernel, node, group, 1, 1);
+      isl_schedule_node_free(node);
     }
     if (contract_data.prefix) 
       isl_union_map_free(contract_data.prefix);
@@ -1108,7 +1126,9 @@ static int populate_array_references_io(struct autosa_local_array_info *local,
       map = isl_map_from_union_map(umap);
       map = isl_map_detect_equalities(map);
 
-      group = isl_calloc_type(ctx, struct autosa_array_ref_group);
+      //group = isl_calloc_type(ctx, struct autosa_array_ref_group);
+      group = new autosa_array_ref_group;
+      group = autosa_array_ref_group_init(group);
       if (!group)
       {
         isl_map_free(map);
@@ -1136,6 +1156,10 @@ static int populate_array_references_io(struct autosa_local_array_info *local,
       group->copy_schedule = NULL;
       group->pe_tile = NULL;
       group->n_mem_ports = 1;
+      group->local_tile = NULL;
+      //std::cout << local->array->tuning_refs[i]->to_str() << std::endl;
+      group->tuning_refs.push_back(std::shared_ptr<TPArrayRef>(local->array->tuning_refs[i]));
+      group->tuning_pe_tile = NULL;
 
       groups[n++] = group;
     }
@@ -1281,10 +1305,18 @@ static __isl_give isl_schedule_node *io_cluster(
   isl_ctx *ctx;
   isl_space *space;
   isl_multi_aff *ma;
+  std::vector<TPIterator *> iters;
 
   mupa = isl_schedule_node_band_get_partial_schedule(node);
   space_dim = isl_schedule_node_band_n_member(node);
   ctx = isl_schedule_node_get_ctx(node);
+
+  /* Store the tuning iters */
+  for (int i = 0; i < isl_schedule_node_band_n_member(node); i++) {
+    iters.push_back((TPIterator *)isl_schedule_node_band_member_get_iter(node, i));
+    //std::cout << "io cluster: " << iters[iters.size() - 1]->name << ", " << 
+    //    iters[iters.size() - 1]->space_time << std::endl;
+  }
 
   /* Build the transformation matrix. */
   trans_mat = isl_mat_alloc(ctx, space_dim, space_dim);
@@ -1294,12 +1326,7 @@ static __isl_give isl_schedule_node *io_cluster(
     d_mat = isl_mat_set_element_val(d_mat, 0, i,
                                     isl_vec_get_element_val(dir, i));
   }
-  null_mat = isl_mat_right_kernel(d_mat);
-  //#ifdef _DEBUG
-  //  DBGVAR(std::cout, isl_mat_rows(null_mat));
-  //  DBGVAR(std::cout, isl_mat_cols(null_mat));
-  //  print_mat(stdout, null_mat);
-  //#endif
+  null_mat = isl_mat_right_kernel(d_mat);  
 
   for (int i = 0; i < isl_mat_cols(null_mat); i++)
     for (int j = 0; j < isl_mat_rows(null_mat); j++)
@@ -1331,10 +1358,6 @@ static __isl_give isl_schedule_node *io_cluster(
     ma = isl_multi_aff_set_aff(ma, i, aff);
   }
 
-//#ifdef _DEBUG
-//  DBGMUPA(stdout, mupa, isl_schedule_node_get_ctx(node));
-//  DBGMA(stdout, ma, isl_schedule_node_get_ctx(node));
-//#endif
   /* Apply the new transformation on the original partial schedule. */
   mupa = isl_multi_union_pw_aff_apply_multi_aff(mupa, isl_multi_aff_copy(ma));
   *io_trans_ma = ma;
@@ -1342,6 +1365,25 @@ static __isl_give isl_schedule_node *io_cluster(
   node = isl_schedule_node_delete(node);
   /* Insert the new partial schedule. */
   node = isl_schedule_node_insert_partial_schedule(node, mupa);
+  /* Add back the tuning iterators.
+   * Since all the io dirs are unit vectors, which means only loop permutation is 
+   * allowed, we simply swap the iter infos.
+   */
+  std::vector<int> swap_index;  
+  for (int i = 0; i < isl_mat_rows(*io_trans_mat); i++) {
+    int tmp = 0;
+    for (int j = 0; j < isl_mat_cols(*io_trans_mat); j++) {
+      isl_val *val_tmp = isl_mat_get_element_val(*io_trans_mat, i, j);
+      tmp += isl_val_get_num_si(val_tmp) * j;
+      isl_val_free(val_tmp);
+    }
+    swap_index.push_back(tmp);
+  }
+  // Restore the loop iterators
+  for (int i = 0; i < isl_schedule_node_band_n_member(node); i++) {
+    //std::cout << "swapped iter: " << iters[swap_index[i]]->name << std::endl;
+    node = isl_schedule_node_band_member_set_iter(node, i, iters[swap_index[i]]);
+  }
 
   isl_mat_free(null_mat);
 
@@ -1646,11 +1688,6 @@ static isl_bool internal_group_in_out_overlap(
 
   /* Remove the local dependency first. */
   access = remove_local_accesses_group_flow(kernel, group, access, prefix, read);
-  
-//#ifdef _DEBUG
-//  DBGUMAP(stdout, access, kernel->ctx);
-//  DBGUMAP(stdout, prefix, kernel->ctx);
-//#endif
 
   /* Tagger maps the tagged iteration domain to untagged iteration domain.
    * Iteration domain is tagged to the access function.
@@ -1683,16 +1720,9 @@ static isl_bool internal_group_in_out_overlap(
   overlap = isl_union_map_apply_range(overlap, isl_union_map_reverse(prefix));
   overlap = isl_union_map_coalesce(overlap);
 
-//#ifdef _DEBUG
-//  DBGUMAP(stdout, overlap, isl_union_map_get_ctx(overlap));
-//  DBGUMAP(stdout, prog->scop->tagged_dep_flow, isl_union_map_get_ctx(overlap));
-//#endif
   /* Derive the overlapping set. */
   overlap = isl_union_map_intersect(overlap,
                                     isl_union_map_copy(prog->scop->tagged_dep_flow));
-//#ifdef _DEBUG
-//  DBGUMAP(stdout, overlap, isl_union_map_get_ctx(overlap));
-//#endif                                    
   empty = isl_union_map_is_empty(overlap);
 
   external = isl_union_map_copy(prog->scop->tagged_dep_flow);
@@ -1729,11 +1759,6 @@ static isl_bool internal_group_in_out_overlap(
     external = isl_union_map_free(external);
   else if (empty)
     external = isl_union_map_universe(external);
-
-//#ifdef _DEBUG
-//  DBGUMAP(stdout, external, isl_union_map_get_ctx(external))
-//  DBGUMAP(stdout, access, isl_union_map_get_ctx(access))
-//#endif
 
   access = isl_union_map_intersect(access, external);
   empty = isl_union_map_is_empty(access);
@@ -1782,14 +1807,8 @@ static isl_bool io_group_carried_by_array_loops(
                                                             isl_union_pw_multi_aff_copy(kernel->contraction));
   isl_schedule_node_free(node);
   access = autosa_io_group_access_relation(group, kernel, read, !read);  
-//#ifdef _DEBUG
-//  DBGUMAP(stdout, access, kernel->ctx);
-//#endif  
   /* Remove the local dependence first. */
   access = remove_local_accesses_group_flow(kernel, group, access, prefix, read);
-//#ifdef _DEBUG
-//  DBGUMAP(stdout, access, kernel->ctx);
-//#endif
 
   tagged = group_tagged_access_relation(group);
   tagger = isl_union_pw_multi_aff_copy(prog->scop->tagger);
@@ -1798,19 +1817,10 @@ static isl_bool io_group_carried_by_array_loops(
                                                    isl_union_set_copy(domain));
 
   prefix = isl_union_map_preimage_domain_union_pw_multi_aff(prefix, tagger);  
-//#ifdef _DEBUG
-//  DBGUMAP(stdout, prefix, isl_union_map_get_ctx(prefix))
-//#endif  
   identity_sched = isl_union_map_apply_range(prefix, 
                                              isl_union_map_reverse(isl_union_map_copy(prefix)));
-//#ifdef _DEBUG
-//  DBGUMAP(stdout, identity_sched, isl_union_map_get_ctx(identity_sched))
-//#endif
   identity_sched = isl_union_map_intersect(identity_sched,
                                            isl_union_map_copy(prog->scop->tagged_dep_flow));
-//#ifdef _DEBUG
-//  DBGUMAP(stdout, identity_sched, kernel->ctx);
-//#endif
   empty = isl_union_map_is_empty(identity_sched);
 
   external = isl_union_map_copy(prog->scop->tagged_dep_flow);
@@ -1827,9 +1837,6 @@ static isl_bool io_group_carried_by_array_loops(
   external = isl_union_map_intersect_params(external,
                                             isl_set_copy(prog->scop->context));
   external = isl_union_map_subtract(external, identity_sched);
-///#ifdef _DEBUG
-///  DBGUMAP(stdout, external, kernel->ctx);
-///#endif
 
   if (read)
   {
@@ -1967,12 +1974,6 @@ isl_bool is_io_module_valid(
       return isl_bool_false;
   }
 
-//#ifdef _DEBUG
-//  if (!strcmp(group->array->name, "C") && read) {
-//    DBGSCHDNODE(stdout, node, kernel->ctx);
-//  }
-//#endif
-
   /* Internal group */
   if (io_group_carried_by_array_loops(node, kernel, group, read)) {
     if (group->io_type == AUTOSA_INT_IO &&
@@ -2028,11 +2029,6 @@ static isl_stat compute_io_group_schedule(
   int space_dim;
   isl_schedule *schedule;
 
-//#ifdef _DEBUG
-//  if (!strcmp(group->array->name, "U_tmp"))
-//    printf("here\n");
-//#endif
-
   /* Sink to the space band */
   schedule = isl_schedule_dup(kernel->schedule);
   node = isl_schedule_get_root(schedule);
@@ -2040,7 +2036,8 @@ static isl_stat compute_io_group_schedule(
 
   node = autosa_tree_move_down_to_array(node, kernel->core);
   node = isl_schedule_node_child(node, 0);
-  space_dim = isl_schedule_node_band_n_member(node);
+  //DBGSCHDNODE(stdout, node, isl_schedule_node_get_ctx(node));
+  space_dim = isl_schedule_node_band_n_member(node);  
   group->space_dim = space_dim;
 
   /* Insert the IO_L1 mark. */
@@ -2064,8 +2061,7 @@ static isl_stat compute_io_group_schedule(
     isl_vec *dir;
     isl_mat *mat;
 
-    /* Perform space-time transformation on the current band. */
-    //if (i == space_dim - 1 && group->io_type == AUTOSA_EXT_IO)
+    /* Perform space-time transformation on the current band. */    
     if (i == space_dim - 1)
     {      
       dir = isl_vec_dup(group->dir);
@@ -2076,9 +2072,6 @@ static isl_stat compute_io_group_schedule(
       dir = isl_vec_zero(ctx, i + 1);
       dir = isl_vec_set_element_si(dir, 0, 1);
     }
-//#ifdef _DEBUG
-//    DBGVEC(stdout, dir, isl_schedule_node_get_ctx(node));
-//#endif
     node = io_cluster(node, dir, &io_trans_mat_i, &io_trans_ma_i);
     isl_vec_free(dir);
 
@@ -2259,14 +2252,6 @@ static isl_stat compute_io_group_schedule(
   group->io_schedule = isl_schedule_dup(sched);
   isl_schedule_free(sched);
   isl_schedule_node_free(node);
-
-//#ifdef _DEBUG
-//  if (!strcmp(group->array->name, "U_tmp") && group->nr == 1) {
-//    //printf("print here\n");
-//    //print_code(gen, group->io_L1_schedule, "U_tmp_1_tmp_code.c");
-//    DBGSCHD(stdout, group->io_L1_schedule, ctx);
-//  }
-//#endif
 
   return isl_stat_ok;
 }
@@ -2783,8 +2768,9 @@ static __isl_give isl_schedule_node *insert_io_module_ids(
       if (filter == NULL)
         filter = uset;
       else
-        filter = isl_union_set_union(filter, uset);
-
+        filter = isl_union_set_union(filter, uset);      
+      //node = isl_schedule_node_insert_filter(node, uset);
+      //node = isl_schedule_node_child(node, 0);      
       isl_id_list_free(ids);      
     }
     node = isl_schedule_node_child(node, 0);
@@ -2854,6 +2840,13 @@ static isl_stat compute_io_group_buffer(struct autosa_kernel *kernel,
           autosa_array_ref_group_compute_tiling(
               group->io_buffers[group->n_io_buffer - 1]->tile, group);
           compute_drain_tiling_at_PE(kernel, group);
+          if (gen->options->autosa->tuning_method == 1) {                        
+            group->io_buffers[group->n_io_buffer - 1]->tuning_tile = TP_infer_tiled_array(gen, kernel, node, group, 0, 1);
+            isl_schedule_node *new_node = isl_schedule_get_root(kernel->schedule);
+            new_node = autosa_tree_move_down_to_pe(new_node, kernel->core);            
+            group->tuning_pe_tile = TP_infer_tiled_array(gen, kernel, node, group, 0, 1); 
+            isl_schedule_node_free(new_node);
+          }
         }
         else
         {
@@ -2874,6 +2867,15 @@ static isl_stat compute_io_group_buffer(struct autosa_kernel *kernel,
           {
             compute_io_tiling_at_PE(kernel, group);
           }
+          if (gen->options->autosa->tuning_method == 1) {
+            group->io_buffers[group->n_io_buffer - 1]->tuning_tile = TP_infer_tiled_array(gen, kernel, node, group, 1, 1);
+            if (group->io_type == AUTOSA_INT_IO && i == 1) {
+              isl_schedule_node *new_node = isl_schedule_get_root(kernel->schedule);
+              new_node = autosa_tree_move_down_to_pe(new_node, kernel->core);              
+              group->tuning_pe_tile = TP_infer_tiled_array(gen, kernel, node, group, 1, 1); 
+              isl_schedule_node_free(new_node);
+            }
+          }          
         }
         else
         {
@@ -2991,6 +2993,7 @@ struct update_group_simd_data
 {
   struct autosa_array_ref_group *group;
   struct autosa_kernel *kernel;
+  int updated;
 };
 
 /* Examine if there is any array references in the "group" under the SIMD loop.
@@ -3042,8 +3045,10 @@ static isl_bool update_group_simd(__isl_keep isl_schedule_node *node, void *user
           uset = isl_union_set_intersect(uset, isl_union_set_copy(domain));
           if (!isl_union_set_is_empty(uset))
           {
-            if (ref->simd_stride == 1)
+            if (ref->simd_stride == 1) {
               group->n_lane = data->kernel->simd_w;
+              data->updated = 1;
+            }
           }
           isl_union_set_free(uset);
         }
@@ -3077,8 +3082,10 @@ static isl_stat compute_io_group_data_pack_sparse(
   node = isl_schedule_get_root(kernel->schedule);
   data.group = group;
   data.kernel = kernel;
+  data.updated = 0;
   isl_schedule_node_foreach_descendant_top_down(node, &update_group_simd, &data);
   isl_schedule_node_free(node);
+
   /* Update the group n_lane considering the sparse information */
   if (group->n_lane % kernel->vec_len != 0) {
     printf("[AutoSA] Error: The sparse block size is not a sub-multiple of the SIMD factor. Abort!\n");
@@ -3118,11 +3125,11 @@ static isl_stat compute_io_group_data_pack_sparse(
   for (int i = 0; i < group->io_level; i++) {
     struct autosa_io_buffer *buf = group->io_buffers[i];
     if (i == 0)
-      cur_max_n_lane = max(group->n_lane, data_pack_ubs[0] / (kernel->n_nzero * ele_size + 1));
+      cur_max_n_lane = std::max(group->n_lane, data_pack_ubs[0] / (kernel->n_nzero * ele_size + 1));
     else if (i > 0 && i < group->io_level - 1)
-      cur_max_n_lane = max(group->n_lane, data_pack_ubs[1] / (kernel->n_nzero * ele_size + 1));
+      cur_max_n_lane = std::max(group->n_lane, data_pack_ubs[1] / (kernel->n_nzero * ele_size + 1));
     else
-      cur_max_n_lane = max(group->n_lane, data_pack_ubs[2] / ((kernel->n_nzero + kernel->n_meta_data) * ele_size));
+      cur_max_n_lane = std::max(group->n_lane, data_pack_ubs[2] / ((kernel->n_nzero + kernel->n_meta_data) * ele_size));
     if (buf->tile) {      
       int n_lane = cur_n_lane;
       isl_val *size = isl_val_copy(buf->tile->bound[group->array->n_index - 1].size);
@@ -3191,6 +3198,31 @@ static isl_stat compute_io_group_data_pack(struct autosa_kernel *kernel,
    * compute the maximal data pack factor. */
   if (max_n_lane == -1)
     max_n_lane = 64 / ele_size;
+  /* Parse the data pack settings. */
+  /* For L1 buffers, we restrain the fifo widths to be no more than 256 bits 
+   * given hardware consideration (on Xilinx). 
+   * Specifically, for FIFOs with depth * width > 512bits, HLS will 
+   * use BRAM/SRL to implement FIFOs, which could potentially increase 
+   * the BRAM/LUT usage by a great scale and cause routing failure.
+   * 
+   * Furthermore, for L1 buffers reside at the io_L1 level (beside PEs), we 
+   * furtehr restrain the FIFO widths to be no more than 64 bits to mitigate 
+   * the potential routing congestion.
+   */  
+  sizes = extract_sizes_from_str(gen->ctx, gen->options->autosa->data_pack_sizes);  
+  data_pack_ubs = read_data_pack_sizes_array(sizes, group->array->name);  
+  if (!data_pack_ubs)
+  {
+    /* Use the default numbers. */
+    data_pack_ubs = isl_alloc_array(gen->ctx, int, 3);
+    data_pack_ubs[0] = 16;
+    //data_pack_ubs[1] = 32;
+    data_pack_ubs[1] = 64;
+    data_pack_ubs[2] = 64;
+  }
+  //std::cout << data_pack_ubs[0] << std::endl;
+  //std::cout << data_pack_ubs[1] << std::endl;
+  //std::cout << data_pack_ubs[2] << std::endl;
 
   /* Examine if any of the array reference in the group is in used by SIMD loop.
    * The default SIMD lane for the group is 1. 
@@ -3202,8 +3234,69 @@ static isl_stat compute_io_group_data_pack(struct autosa_kernel *kernel,
   node = isl_schedule_get_root(kernel->schedule);
   data.group = group;
   data.kernel = kernel;
+  data.updated = 0;
   isl_schedule_node_foreach_descendant_top_down(node, &update_group_simd, &data);
   isl_schedule_node_free(node);
+
+  if (gen->options->autosa->tuning_method == 1) {    
+    /* Update the data packing factor */
+    for (int i = 0; i < group->io_level; i++) {
+      struct autosa_io_buffer *buf = group->io_buffers[i];
+      if (buf->tuning_tile && buf->tuning_tile->data_pack_factor_inter == NULL) {        
+        /* Inter */
+        class TPParameter *dp = new TPParameter("p" + std::to_string(kernel->tuning_program->params.size()));
+        dp->tune = false;
+        dp->attr = "data_pack_factor";
+        dp->tags.insert("auto_infer");
+        dp->tags.insert("power_of_two");
+        /* Update the bounds */
+        /* lb */
+        if (data.updated == 0) {          
+          dp->bounds.push_back(std::make_shared<TPExpr>("literal", new TPConst(1)));
+        } else {
+          /* Find the SIMD tiling factor */
+          for (auto param : kernel->tuning_program->params) {
+            if (param->attr == "SIMD_tiling_factor") {              
+              dp->bounds.push_back(std::make_shared<TPExpr>("literal", param->dup()));
+              dp->multiples.push_back(std::make_shared<TPExpr>("literal", param->dup()));
+            }
+          }
+        }
+        /* ub */
+        int user_max_n_lane;
+        if (i == 0)
+          user_max_n_lane = data_pack_ubs[0] / ele_size;
+        else if (i > 0 && i < group->io_level - 1)
+          user_max_n_lane = data_pack_ubs[1] / ele_size;
+        else
+          user_max_n_lane = data_pack_ubs[2] / ele_size;
+        TPExpr *ub = buf->tuning_tile->sizes[buf->tuning_tile->sizes.size() - 1]->dup();
+        ub = ub->min(new TPExpr("literal", new TPConst(user_max_n_lane)));
+        ub = ub->max(dp->bounds[0]->dup());
+        dp->bounds.push_back(std::shared_ptr<TPExpr>(ub));        
+        dp->divisors.push_back(std::shared_ptr<TPExpr>(buf->tuning_tile->sizes[buf->tuning_tile->sizes.size() - 1]->dup()));
+        assert(dp->bounds.size() == 2);    
+        buf->tuning_tile->data_pack_factor_inter = dp;
+        kernel->tuning_program->params.push_back(dp);
+        kernel->tuning_program->param_map[dp->name] = dp;
+
+        /* Intra */
+        if (data.updated == 0) {
+          buf->tuning_tile->data_pack_factor_intra = std::make_shared<TPExpr>("literal", new TPConst(1));          
+        } else {
+          /* Find the SIMD tiling factor */
+          for (auto param : kernel->tuning_program->params) {
+            if (param->attr == "SIMD_tiling_factor") {              
+              buf->tuning_tile->data_pack_factor_intra = std::make_shared<TPExpr>("literal", param->dup());              
+            }
+          }
+        }
+
+        break;
+      }
+    }            
+  }
+
   if (max_n_lane % group->n_lane != 0)
   {
     printf("[AutoSA] Error: The data is not aligned to the DRAM port. Abort!\n");
@@ -3226,41 +3319,16 @@ static isl_stat compute_io_group_data_pack(struct autosa_kernel *kernel,
 
   int cur_n_lane = group->n_lane;
   int status = false;
-  /* For L1 buffers, we restrain the fifo widths to be no more than 256 bits 
-   * given hardware consideration (on Xilinx). 
-   * Specifically, for FIFOs with depth * width > 512bits, HLS will 
-   * use BRAM/SRL to implement FIFOs, which could potentially increase 
-   * the BRAM/LUT usage by a great scale and cause routing failure.
-   * 
-   * Furthermore, for L1 buffers reside at the io_L1 level (beside PEs), we 
-   * furtehr restrain the FIFO widths to be no more than 64 bits to mitigate 
-   * the potential routing congestion.
-   */
-  /* Parse the data pack settings. */
-  sizes = extract_sizes_from_str(gen->ctx, gen->options->autosa->data_pack_sizes);
-  //data_pack_ubs = read_data_pack_sizes(sizes, 3);
-  data_pack_ubs = read_data_pack_sizes_array(sizes, group->array->name);
-  //std::cout << group->array->name << std::endl;
-  //std::cout << data_pack_ubs[2] << std::endl;
-  if (!data_pack_ubs)
-  {
-    /* Use the default numbers. */
-    data_pack_ubs = isl_alloc_array(gen->ctx, int, 3);
-    data_pack_ubs[0] = 8;
-    data_pack_ubs[1] = 32;
-    data_pack_ubs[2] = 64;
-  }
-
   int cur_max_n_lane;
   for (int i = 0; i < group->io_level; i++)
   {
     struct autosa_io_buffer *buf = group->io_buffers[i];
     if (i == 0)
-      cur_max_n_lane = max(group->n_lane, data_pack_ubs[0] / ele_size);
+      cur_max_n_lane = std::max(group->n_lane, data_pack_ubs[0] / ele_size);
     else if (i > 0 && i < group->io_level - 1)
-      cur_max_n_lane = max(group->n_lane, data_pack_ubs[1] / ele_size);
+      cur_max_n_lane = std::max(group->n_lane, data_pack_ubs[1] / ele_size);
     else
-      cur_max_n_lane = max(group->n_lane, data_pack_ubs[2] / ele_size);
+      cur_max_n_lane = std::max(group->n_lane, data_pack_ubs[2] / ele_size);
     if (buf->tile && group->array->n_index > 0)
     {      
       size = isl_val_copy(buf->tile->bound[group->array->n_index - 1].size);
@@ -3765,6 +3833,98 @@ static isl_stat insert_L2_io_buffer(
   return isl_stat_ok;
 }
 
+/* This function hoists the L1 I/O buffer to save the data communication.
+ * It tries to hoist up the buffer if the local buffer size is irrelavant to the outer loop.
+ */
+static isl_stat hoist_L1_io_buffer(
+  struct autosa_kernel *kernel, 
+  struct autosa_array_ref_group *group,
+  struct autosa_gen *gen,
+  struct autosa_group_data *data  
+) {
+  struct autosa_io_buffer *cur_buffer;
+  int io_level = group->io_level;
+  isl_schedule_node *node, *node_cp;
+  int n, i;  
+  std::vector<isl_val *> cur_dims;
+  std::vector<isl_val *> prev_dims;
+  isl_union_set *L1_io_buffer_domain = NULL;
+  int L1_io_buffer_depth = -1;
+  
+  struct autosa_array_tile *cur_tile;
+
+  for (int i = io_level; i >= 1; i--) {
+    cur_buffer = group->io_buffers[i - 1];
+    if (cur_buffer->tile)
+      break;
+  }
+
+  for (int i = 0; i < cur_buffer->tile->n; i++) {
+    prev_dims.push_back(cur_buffer->tile->bound[i].size);
+  }    
+  cur_tile = cur_buffer->tile;
+
+  node = isl_schedule_get_root(group->io_schedule);
+  //DBGSCHDNODE(stdout, node, gen->ctx);  
+  /* Insert the filter ids. */
+  node = autosa_tree_move_down_to_io_mark(node, kernel->core, cur_buffer->level);  
+  node = insert_io_module_ids(gen, kernel, node, group->space_dim, cur_buffer->level);  
+  node = autosa_tree_move_up_to_array(node);
+  node = isl_schedule_node_parent(node);
+  //DBGSCHDNODE(stdout, node, gen->ctx);  
+  n = isl_schedule_node_band_n_member(node);  
+  for (i = n - 1; i > 0; i--) {
+    node_cp = isl_schedule_node_copy(node);
+    node_cp = isl_schedule_node_band_split(node_cp, i);
+    node_cp = isl_schedule_node_child(node_cp, 0);
+    if (group->group_type == AUTOSA_DRAIN_GROUP)
+      compute_group_bounds_drain_at_node(kernel, group, node_cp, cur_buffer);
+    else if (group->group_type == AUTOSA_IO_GROUP)
+      compute_group_bounds_io_at_node(kernel, group, node_cp, cur_buffer);
+    autosa_array_ref_group_compute_tiling(cur_buffer->tile, group);
+    /* Test if the last dim is changed. */    
+    bool is_equal = true;
+    for (int d = 0; d < cur_buffer->tile->n; d++) {
+      if (!isl_val_eq(cur_buffer->tile->bound[d].size, prev_dims[d])) {
+        //DBGVAL(stdout, cur_buffer->tile->bound[d].size, gen->ctx);
+        //DBGVAL(stdout, prev_dims[d], gen->ctx);
+        is_equal = false;
+        break;
+      }
+    }    
+    autosa_array_tile_free(cur_buffer->tile);    
+    if (!is_equal) {            
+      isl_schedule_node_free(node_cp);
+      break;
+    } else {      
+      L1_io_buffer_depth = isl_schedule_node_get_schedule_depth(node_cp);
+      L1_io_buffer_domain = isl_union_set_free(L1_io_buffer_domain);
+      /* Compute the domain. */      
+      isl_union_map *partial = isl_schedule_node_band_get_partial_schedule_union_map(node_cp);
+      /* Delete the module id filter */
+      node_cp = autosa_tree_move_up_to_kernel(node_cp);
+      node_cp = isl_schedule_node_child(node_cp, 0); 
+      node_cp = isl_schedule_node_child(node_cp, 0); 
+      node_cp = isl_schedule_node_delete(node_cp);
+      node_cp = autosa_tree_move_down_to_array(node_cp, kernel->core);
+      node_cp = isl_schedule_node_parent(node_cp);
+      isl_union_set *domain = isl_schedule_node_get_domain(node_cp);
+      partial = isl_union_map_intersect_domain(partial, domain);
+      isl_union_set *range = isl_union_map_range(isl_union_map_copy(partial));      
+      range = isl_union_set_lexmin(range);      
+      partial = isl_union_map_intersect_range(partial, range);      
+      L1_io_buffer_domain = isl_union_map_domain(partial);
+      isl_schedule_node_free(node_cp);
+    }
+  }  
+  isl_schedule_node_free(node);
+  cur_buffer->tile = cur_tile;
+  cur_buffer->hoist_depth = L1_io_buffer_depth;
+  cur_buffer->hoist_domain = L1_io_buffer_domain;
+
+  return isl_stat_ok;
+}
+
 /* This function tries to hoist the L2 I/O buffer to increase the memory 
  * coelescing. 
  * 
@@ -3825,9 +3985,7 @@ static isl_stat hoist_L2_io_buffer(
     /* Insert the filter ids. */
     node = autosa_tree_move_down_to_io_mark(node, kernel->core, io_level);
     node = insert_io_module_ids(gen, kernel, node, group->space_dim, io_level);    
-    node = autosa_tree_move_up_to_array(node);
-
-    //node = autosa_tree_move_down_to_array(node, kernel->core);
+    node = autosa_tree_move_up_to_array(node);    
     node = isl_schedule_node_parent(node);
     n = isl_schedule_node_band_n_member(node);
     for (i = n - 1; i > 0; i--)
@@ -3841,13 +3999,7 @@ static isl_stat hoist_L2_io_buffer(
         compute_group_bounds_io_at_node(kernel, group, node_cp, cur_buffer);
       autosa_array_ref_group_compute_tiling(cur_buffer->tile, group);
       /* Test if the last dim is increased. */
-      cur_last_dim = cur_buffer->tile->bound[cur_buffer->tile->n - 1].size;
-      /* #ifdef _DEBUG
-      pd = isl_printer_to_file(gen->ctx, stdout);
-      pd = isl_printer_print_val(pd, cur_buffer->tile->bound[0].size);
-      pd = isl_printer_end_line(pd);
-      pd = isl_printer_free(pd);      
-#endif */
+      cur_last_dim = cur_buffer->tile->bound[cur_buffer->tile->n - 1].size;      
       is_last_dim_equal = isl_val_eq(cur_last_dim, nxt_last_dim);
       isl_schedule_node_free(node_cp);
       if (!is_last_dim_equal)
@@ -4074,17 +4226,6 @@ static int group_array_references_io(struct autosa_kernel *kernel,
   for (i = 0; i < local->array->n_ref; i++)
   {    
     struct autosa_stmt_access *ref = local->array->refs[i];
-//#ifdef _DEBUG    
-//    if (!strcmp(local->array->name, "U_tmp")) {
-//      DBGMAP(stdout, ref->access, ctx);
-//      printf("n_io_info: %d\n", ref->n_io_info);
-//      for (int j = 0; j < ref->n_io_info; j++) {
-//        struct autosa_io_info *io_info = ref->io_info[j];
-//        DBGBMAP(stdout, io_info->dep->isl_dep, ctx);
-//        printf("%d\n", io_info->io_type);
-//      }
-//    }
-//#endif
     for (j = 0; j < ref->n_io_info; j++) {
       struct autosa_io_info *io_info = ref->io_info[j];
       if (io_info->dep->type == AUTOSA_DEP_RAW || io_info->dep->type == AUTOSA_DEP_RAR)
@@ -4094,6 +4235,7 @@ static int group_array_references_io(struct autosa_kernel *kernel,
 
   groups = (struct autosa_array_ref_group **)calloc(n,
                                                     sizeof(struct autosa_array_ref_group *));
+  //groups = new autosa_array_ref_group*[n];
   if (!groups)
     return -1;
 
@@ -4251,6 +4393,7 @@ static int compute_group_bounds_drain(struct autosa_kernel *kernel,
 static int group_array_references_drain(struct autosa_kernel *kernel,
                                         struct autosa_local_array_info *local, struct autosa_group_data *data)
 {
+  local->drain_group = NULL;
   if (local->array->local)
     return 0;
 
@@ -4258,22 +4401,23 @@ static int group_array_references_drain(struct autosa_kernel *kernel,
   int n;
   isl_ctx *ctx = isl_union_map_get_ctx(data->pe_sched);
   struct autosa_array_ref_group **groups = NULL;
-  isl_union_map *dep_waw = kernel->scop->tagged_dep_waw;
+  isl_union_map *dep_waw = kernel->scop->tagged_dep_waw;  
 
   /* Populate the groups. */
   n = 0;
   for (int i = 0; i < local->array->n_ref; ++i)
   {
-    struct autosa_stmt_access *access = local->array->refs[i];
-    if (access->read)
+    struct autosa_stmt_access *access = local->array->refs[i];    
+    if (!access->write)
       continue;
     isl_set *domain = isl_map_domain(isl_map_copy(access->access));
     isl_set *access_domain = isl_union_set_extract_set(
         kernel->expanded_domain,
         isl_set_get_space(domain));
     isl_set_free(domain);
+    
     struct extract_access_waw_domain_data drain_data = {access, access_domain};
-    isl_union_map_every_map(dep_waw, &extract_access_waw_domain_wrap, &drain_data);
+    isl_union_map_every_map(dep_waw, &extract_access_waw_domain_wrap, &drain_data);    
     if (!isl_set_is_empty(drain_data.drain_domain))
     {
       isl_map *map;
@@ -4288,8 +4432,10 @@ static int group_array_references_drain(struct autosa_kernel *kernel,
       map = isl_map_detect_equalities(map);
 
       /* Add this access relation to the group. */
-      struct autosa_array_ref_group *group =
-          isl_calloc_type(ctx, struct autosa_array_ref_group);
+      //struct autosa_array_ref_group *group =
+      //    isl_calloc_type(ctx, struct autosa_array_ref_group);
+      struct autosa_array_ref_group *group = new autosa_array_ref_group;
+      group = autosa_array_ref_group_init(group);
       if (!group)
       {
         isl_map_free(map);
@@ -4322,10 +4468,19 @@ static int group_array_references_drain(struct autosa_kernel *kernel,
       group->io_buffers = NULL;
       group->copy_schedule = NULL;
       group->pe_tile = NULL;
+      group->local_tile = NULL;
       group->n_mem_ports = 1;
+      group->tuning_refs.push_back(std::shared_ptr<TPArrayRef>(local->array->tuning_refs[i]));
+      group->tuning_pe_tile = NULL;
 
-      groups = (struct autosa_array_ref_group **)realloc(groups, (++n) *
-                                                                     sizeof(struct autosa_array_ref_group *));
+      //groups = (struct autosa_array_ref_group **)realloc(groups, (++n) *
+      //                                                               sizeof(struct autosa_array_ref_group *));      
+      struct autosa_array_ref_group **groups_tmp = isl_calloc_array(ctx, struct autosa_array_ref_group *, ++n);
+      for (int g = 0; g < n - 1; g++) {
+        groups_tmp[g] = groups[g];
+      }
+      free(groups);
+      groups = groups_tmp;      
       groups[n - 1] = group;
     }
     isl_set_free(drain_data.drain_domain);
@@ -4439,32 +4594,38 @@ static isl_stat autosa_io_buffer_allocate(struct autosa_kernel *kernel,
   {
     struct autosa_local_array_info *local = &kernel->array[i];
     for (int j = 0; j < local->n_io_group; j++)
-    {
-      //if (local->io_groups[j]->copy_in || local->io_groups[j]->copy_out) {
-        compute_io_group_buffer(kernel, local->io_groups[j], gen);      
-        if (gen->options->autosa->two_level_buffer)
-        {
-          /* Seek the opportunity to hoist up the L2 I/O buffers. */
-          hoist_L2_io_buffer(kernel, local->io_groups[j], gen, data);
-        }      
-        if (gen->options->autosa->local_reduce && local->io_groups[j]->attached_drain_group)
-        {
-          if (gen->options->autosa->two_level_buffer) {
-            /* At present, two-level buffer and local reduce can be enabled at the same time.
-             */
-            throw std::runtime_error("[AutoSA] Error: Two-level buffer and local reduce can't be used at the same time.");
-          }        
+    {      
+      compute_io_group_buffer(kernel, local->io_groups[j], gen);            
+      if (!gen->options->autosa->lower_int_io_L1_buffer) {
+        /* Hoist the L1 I/O buffer. 
+         * Do not touch internal array when local reduce is enabled.
+         */
+        if (!(gen->options->autosa->local_reduce && local->array_type == AUTOSA_INT_ARRAY)) {
+          if (kernel->array_part_w > 0)
+            hoist_L1_io_buffer(kernel, local->io_groups[j], gen, data);
         }
-        if (gen->options->autosa->lower_int_io_L1_buffer) {
-          /* Lower the L1 buffer for interior I/O module if possible. */
-          lower_int_io_L1_buffer(kernel, local->io_groups[j], gen);
-          /* Enable the second-level buffer for this array */
-          insert_L2_io_buffer(kernel, local->io_groups[j], gen);
-          /* Seek the opportunity to hoist up the L2 I/O buffers. */
-          //hoist_L2_io_buffer(kernel, local->io_groups[j], gen, data);
-        }
-      //}
-    }
+      }      
+      if (gen->options->autosa->two_level_buffer)
+      {
+        /* Seek the opportunity to hoist up the L2 I/O buffers. */
+        hoist_L2_io_buffer(kernel, local->io_groups[j], gen, data);
+      }            
+      if (gen->options->autosa->local_reduce && local->io_groups[j]->attached_drain_group)
+      {
+        if (gen->options->autosa->two_level_buffer) {
+          /* At present, two-level buffer and local reduce can be enabled at the same time. */
+          throw std::runtime_error("[AutoSA] Error: Two-level buffer and local reduce can't be used at the same time.");
+        }        
+      }      
+      if (gen->options->autosa->lower_int_io_L1_buffer) {
+        /* Lower the L1 buffer for interior I/O module if possible. */
+        lower_int_io_L1_buffer(kernel, local->io_groups[j], gen);
+        /* Enable the second-level buffer for this array */
+        insert_L2_io_buffer(kernel, local->io_groups[j], gen);
+        /* Seek the opportunity to hoist up the L2 I/O buffers. */
+        //hoist_L2_io_buffer(kernel, local->io_groups[j], gen, data);
+      }            
+    }    
     if (local->drain_group)
     {      
       compute_io_group_buffer(kernel, local->drain_group, gen);
@@ -4524,6 +4685,164 @@ static isl_stat autosa_io_data_pack(struct autosa_kernel *kernel,
     }
   }
   return isl_stat_ok;
+}
+
+/* Construct a map from domain_space to domain_space that increments
+ * the dimension at position "pos" and leaves all other dimensions constant. 
+ */
+static __isl_give isl_map *next(__isl_take isl_space *domain_space, int pos)
+{
+  isl_space *space;
+  isl_aff *aff;
+  isl_multi_aff *next;
+
+  space = isl_space_map_from_set(domain_space);
+  next = isl_multi_aff_identity(space);
+  aff = isl_multi_aff_get_aff(next, pos);
+  aff = isl_aff_add_constant_si(aff, 1);
+  next = isl_multi_aff_set_aff(next, pos, aff);
+
+  return isl_map_from_multi_aff(next);
+}
+
+/* This function generates different possible loop orderings for the array partitioning loop band.
+ * For I/O groups with external array, we will select the loops that do not appear in the 
+ * array indices, and select them as the innermost loop in the generated loop ordering.
+ * There are several considerations here.
+ * 1. Why consider loop index, but not data dependence?
+ * For external groups, we don't handle overlapping reuse. For example, when the 
+ * reuse factor is (1,-1). In the next iteration, we will only load part of the data
+ * and reuse some data left in the previous iteration. However, this brings additional 
+ * hardware overheads for indexing the new data and rearranging the old data. 
+ * Therefore, such overlapping reuse is not considered. In other words, only reuse 
+ * vectors that are in the form of unit vectors are considered. 
+ * Therefore, we will only look for loop indices not showing the array index.
+ * 2. Why put them innermost?
+ * Placing reuse loops innermost maximizes the locality and minimizes the data communication.
+ * The relative order between reuse loops and non-reuse loops doesn't matter as overlapped reuse 
+ * is not supported. Therefore, we will only randomly pick one loop order for this group.
+ * 
+ * For I/O groups with internal array, simply, we choose to examine the array indexs.
+ * And select the loops that doesn't appear in these indices. This is due to the same 
+ * reason as argued above for the simplification of the architecture.
+ * 
+ * Drain I/O groups are not considered as the data communication volumn is fixed and 
+ * is not affected by the loop permutation.
+ */
+static void explore_loop_permute(struct autosa_kernel *kernel, struct autosa_gen *gen) {
+  /* Count the number of possible loop permutation. */
+  int n_order = 0;
+  std::vector<std::unordered_set<int>> loop_orderings;
+  isl_schedule_node *node = isl_schedule_get_root(kernel->schedule);
+  node = autosa_tree_move_down_to_array(node, kernel->core);
+  isl_union_map *prefix = isl_schedule_node_get_prefix_schedule_relation(node);
+  isl_schedule_node_free(node);
+  
+  for (int i = 0; i < kernel->n_array; i++) {
+    struct autosa_local_array_info *local = &kernel->array[i];
+    for (int j = 0; j < local->n_io_group; j++) {
+      struct autosa_array_ref_group *group = local->io_groups[j];      
+      for (int r = 0; r < group->n_ref; r++) {
+        struct autosa_stmt_access *ref = group->refs[r];
+        isl_map *acc = isl_map_from_union_map(isl_union_map_apply_domain(
+                          isl_union_map_from_map(isl_map_copy(ref->access)),
+                          isl_union_map_copy(prefix)));
+        int n_dim = isl_map_dim(acc, isl_dim_in);
+        std::unordered_set<int> reuse_loops;
+        for (int d = 0; d < n_dim; d++) {
+          /* We will test if the array elements accessed by the iterations that increased 
+           * at position "d" is the same as the original array elements.
+           */
+          isl_space *space = isl_map_get_space(acc);
+          space = isl_space_domain(space);
+          isl_map *next_iter = next(space, d);                    
+          isl_map *map = isl_map_apply_domain(next_iter, isl_map_copy(acc));
+          map = isl_map_apply_range(map, isl_map_copy(acc));
+          map = isl_map_coalesce(map);          
+          isl_set *domain = isl_map_domain(isl_map_copy(map));
+          isl_set *range = isl_map_range(isl_map_copy(map));          
+          isl_map_free(map);
+          if (isl_set_is_subset(domain, range) && isl_set_is_subset(range, domain)) {            
+            //std::cout << d << std::endl;
+            reuse_loops.insert(d);
+          }          
+          isl_set_free(domain);
+          isl_set_free(range);
+        }        
+        isl_map_free(acc);
+        if (reuse_loops.size() > 0) {
+          // Prune the duplicated ordering.
+          int d = 0;
+          for (d = 0; d < loop_orderings.size(); d++) {
+            if (loop_orderings[d] == reuse_loops) 
+              break;
+          }
+          if (d == loop_orderings.size())
+            loop_orderings.push_back(reuse_loops);
+        }
+      }
+    }
+  }  
+  isl_union_map_free(prefix);
+  n_order = loop_orderings.size();
+
+  /* When there is more than one loop permutation found,
+   * We will print a temp file named by the sequence of the next loop ordering to the 
+   * temporary directory. For example, when there are two orderings, 
+   * in the first-time compilation, we print a file named "permute_1" to the tmp directory.
+   * AutoSA wrapper script will then call the compilation again serving this index 
+   * as the next loop ordering to be selected.
+   * This process is iterated until all the orderings are explored.
+   * In the last ordering, we print "permute_done" instead, which will instruct the 
+   * wrapper script to stop calling the program.
+   */
+  if (n_order == 1)
+    return;
+
+  int cur_n_order = gen->options->autosa->loop_permute_order;
+  if (gen->options->autosa->tuning_method == 1) {
+    /* Print the tmp file. */  
+    isl_printer *p_str = isl_printer_to_str(gen->ctx);
+    p_str = isl_printer_print_str(p_str, gen->options->autosa->output_dir);
+    p_str = isl_printer_print_str(p_str, "/permute_");
+    if (cur_n_order == n_order - 1) {
+      p_str = isl_printer_print_str(p_str, "done");
+    } else {
+      p_str = isl_printer_print_int(p_str, cur_n_order + 1);
+    }
+    char *file_name = isl_printer_get_str(p_str);
+    isl_printer_free(p_str);
+    FILE *fp = fopen(file_name, "w");
+    fclose(fp);    
+
+    kernel->tuning_program->id2 = cur_n_order;
+  }
+
+  /* Modify the loop ordering. */
+  std::unordered_set<int> order = loop_orderings[cur_n_order];
+  node = isl_schedule_get_root(kernel->schedule);
+  node = autosa_tree_move_down_to_array(node, kernel->core);
+  node = isl_schedule_node_parent(node);
+  int n_dim = isl_schedule_node_band_n_member(node);
+  std::unordered_map<int, int> pos_map;
+  for (int p = 0; p < n_dim; p++) {
+    pos_map[p] = p;
+  }
+  int n_processed = 0;
+  for (auto o : order) {
+    //std::cout << o << std::endl;
+    /* Move the "o"-th loop inside */    
+    node = loop_interchange_at_node(node, pos_map[o], n_dim - 1 - n_processed);
+    pos_map[n_dim - 1 - n_processed] = pos_map[o];
+    pos_map[o] = n_dim - 1 - n_processed;
+    n_processed++;
+  }
+  //DBGSCHDNODE(stdout, node, gen->ctx);
+  isl_schedule_free(kernel->schedule);
+  kernel->schedule = isl_schedule_node_get_schedule(node);
+  isl_schedule_node_free(node);
+
+  // TODO: Test if we need to update anything else
 }
 
 /* Group references of all arrays in "kernel".
@@ -4594,6 +4913,11 @@ isl_stat sa_io_construct_optimize(struct autosa_kernel *kernel, struct autosa_ge
     r = group_array_references_drain(kernel, &kernel->array[i], &data);
     if (r < 0)
       break;
+  }
+
+  if (kernel->scop->options->autosa->explore_loop_permute == 1) {
+      /* Explore different loop orderings of the array partitioning band. */
+    explore_loop_permute(kernel, gen);
   }
 
   /* Perform I/O Optimization */  
@@ -4674,10 +4998,29 @@ isl_stat sa_io_construct_optimize(struct autosa_kernel *kernel, struct autosa_ge
   /* Print the IO grouping information */
   print_io_grouping_info(stdout, kernel);
 
+  /* Test if there is any IO group with internal array and needs copy-in. 
+   * Such designs can't run due to the HLS limitation. 
+   * Code generation will proceeed as usual only for tuning purpose.
+   */
+  bool is_safe = true;
+  for (int i = 0; i < kernel->n_array; i++) {
+    struct autosa_local_array_info *local = &kernel->array[i];
+    for (int j = 0; j < local->n_io_group; j++) {
+      struct autosa_array_ref_group *group = local->io_groups[j];
+      if (group->copy_in && local->array_type == AUTOSA_INT_ARRAY) {
+        is_safe = false;
+      }
+    }
+  }
+  if (!is_safe) {
+    printf("[AutoSA] Warning: The generated program contains feedback loops and can't be synthesized by HLS.\n");
+    printf("                  The compilation flow will proceed as usual.\n");
+  }
+    
   /* I/O buffer allocation */
-  autosa_io_buffer_allocate(kernel, gen, &data);
+  autosa_io_buffer_allocate(kernel, gen, &data);  
   /* I/O module data pack */
-  autosa_io_data_pack(kernel, gen, &data);
+  autosa_io_data_pack(kernel, gen, &data);    
 
   /* Since different I/O groups of the same array will access the DRAM with the 
    * same global array pointer. We will need to make sure the outermost 
@@ -4734,8 +5077,8 @@ isl_stat sa_io_construct_optimize(struct autosa_kernel *kernel, struct autosa_ge
       }
     }
 
-    local_array->n_lane = max(1, n_lane);
-    local_array->array->n_lane = max(1, n_lane);
+    local_array->n_lane = std::max(1, n_lane);
+    local_array->array->n_lane = std::max(1, n_lane);
   }
 
   isl_union_map_free(data.host_sched);

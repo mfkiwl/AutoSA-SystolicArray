@@ -27,8 +27,8 @@
 
 #include "ppcg.h"
 #include "schedule.h"
-#include "gpu.h"
 #include "util.h"
+#include "autosa_tuning.h"
 
 #ifdef _DEBUG
 #define D(x) x
@@ -36,8 +36,12 @@
 #define D(x)
 #endif
 
-#define min(a, b) (((a) < (b)) ? (a) : (b))
-#define max(a, b) (((a) > (b)) ? (a) : (b))
+#if defined(__cplusplus)
+extern "C" {
+#endif  
+
+//#define min(a, b) (((a) < (b)) ? (a) : (b))
+//#define max(a, b) (((a) > (b)) ? (a) : (b))
 
 /* If enabled, use the default ISL sink API. */
 //#define ISL_SINK
@@ -118,14 +122,16 @@ enum autosa_group_type
 enum autosa_array_type
 {
   AUTOSA_EXT_ARRAY,
-  AUTOSA_INT_ARRAY
+  AUTOSA_INT_ARRAY,
+  AUTOSA_UNKNOWN_ARRAY
 };
 
 enum platform
 {
   INTEL_HW,
   XILINX_HW,
-  CATAPULT_HW
+  CATAPULT_HW,
+  TAPA_HW
 };
 
 struct autosa_dep
@@ -184,6 +190,7 @@ struct autosa_kernel
 
   int n_sa_dim;
   int sa_dim[3];
+  int space_parallel[3];
   int space_time_id;
   int array_part_w;
   int space_w;
@@ -308,6 +315,9 @@ struct autosa_kernel
   float compress_ratio;
   int n_meta_data;
   float eff_compress_ratio;
+
+  /* Tuning program */
+  TuningProgram *tuning_program;
 };
 
 struct autosa_io_info
@@ -462,6 +472,8 @@ struct autosa_array_info
   int copy_in;
   /* Is the array to be copied out from the device memory? */
   int copy_out;
+  /* Tuning array refs */
+  std::vector<std::shared_ptr<TPArrayRef>> tuning_refs;
   /* AutoSA Extended */
 };
 
@@ -478,6 +490,11 @@ struct autosa_io_buffer
   /* Is the buffer data sparse */
   int sparse;
   int vec_len;
+  /* Tuning array tile */
+  TPArrayTile *tuning_tile;
+  /* Used for hoisting buffer */
+  int hoist_depth;
+  isl_union_set *hoist_domain;
 };
 
 /* A group of array references in a kernel that should be handled together. 
@@ -569,6 +586,10 @@ struct autosa_array_ref_group
   int copy_out;
   /* Attached drain group */
   struct autosa_array_ref_group *attached_drain_group;  
+  /* Tuning array refs */
+  std::vector<std::shared_ptr<TPArrayRef>> tuning_refs;
+  TPArrayTile *tuning_pe_tile;
+  TPArrayTile *tuning_local_tile;
   /* AutoSA Extended */
 };
 
@@ -616,8 +637,8 @@ struct autosa_local_array_info
   int n_io_group_refs;
   /* Number of external memory ports that this array is allocated. */
   int n_mem_ports;
-  /* Map from io_group_ref to mem_port. */
-  std::vector<std::pair<int, int> > group_ref_mem_port_map;
+  /* Map from io_group_ref to mem_port. */  
+  std::vector<int> group_ref_mem_port_map;  
 
   /* Default groups */
   int n_group;
@@ -691,7 +712,7 @@ struct autosa_prog
   struct autosa_stmt *stmts;
 
   int n_array;
-  struct autosa_array_info *array;
+  struct autosa_array_info *array;  
 };
 
 struct autosa_hw_top_module
@@ -852,6 +873,29 @@ struct autosa_hw_module
   int n_fifo_intra;
   char **fifo_names_intra;
   isl_pw_qpolynomial **fifo_bounds_intra;  
+
+  /* Tuning purpose */
+  /* Latency */
+  isl_schedule *tuning_sched;
+  isl_schedule *tuning_outer_sched;
+  isl_schedule *tuning_inter_sched;
+  isl_schedule *tuning_intra_sched;  
+
+  isl_ast_node *tuning_tree;
+  isl_ast_node *tuning_device_tree;  
+  isl_ast_node *tuning_intra_tree;
+  isl_ast_node *tuning_inter_tree;  
+  
+  /* Counting module numbers */
+  isl_schedule *tuning_num_sched;
+  isl_schedule *tuning_num_outer_sched;
+  isl_schedule *tuning_num_inter_sched;
+  isl_schedule *tuning_num_intra_sched;  
+
+  isl_ast_node *tuning_num_tree;
+  isl_ast_node *tuning_num_device_tree;  
+  isl_ast_node *tuning_num_intra_tree;
+  isl_ast_node *tuning_num_inter_tree;
 };
 
 struct autosa_gen
@@ -897,6 +941,9 @@ struct autosa_gen
 
   /* Tuning configuration */
   cJSON *tuning_config;
+
+  /* Tuning programs */
+  std::vector<TuningProgram *> tuning_progs;
 };
 
 /* Representation of special statements, in particular copy statements
@@ -981,6 +1028,7 @@ struct autosa_kernel_stmt
       struct autosa_array_ref_group *group;
       struct autosa_hw_module *module;      
       int simd_depth;
+      int if_depth;
     } i;
     struct
     {
@@ -1030,6 +1078,7 @@ struct autosa_node_band_prop
   enum autosa_loop_type *pe_opt;
   enum autosa_loop_type *space_time;
   int *sched_pos;
+  void *iter[20];
   int n_member;
   isl_multi_union_pw_aff *mupa;
 };
@@ -1165,7 +1214,7 @@ __isl_give isl_schedule_node *autosa_node_interchange_up(
     __isl_take isl_schedule_node *node);
 isl_bool no_permutable_node(__isl_keep isl_schedule_node *node, void *user);
 isl_bool all_parallel_node(__isl_keep isl_schedule_node *node, void *user);
-isl_bool isl_schedule_node_is_io_mark(__isl_keep isl_schedule_node *node, int io_level);
+//isl_bool isl_schedule_node_is_io_mark(__isl_keep isl_schedule_node *node, int io_level);
 int is_node_under_simd(__isl_keep isl_schedule_node *node);
 int is_node_under_latency(__isl_keep isl_schedule_node *node);
 int *extract_band_upper_bounds(__isl_keep isl_schedule_node *node);
@@ -1270,8 +1319,21 @@ int extract_memory_type(struct autosa_hw_module *module,
                         struct autosa_kernel_var *var, int uram);
 isl_stat sa_extract_design_info(struct autosa_gen *gen);
 
+/* Tuning program */
+isl_stat TP_extract_loop_info(struct autosa_gen *gen, struct autosa_hw_module *module);
+isl_stat TP_extract_resource_info(struct autosa_gen *gen, struct autosa_hw_module *module);
+isl_stat TP_extract_module_attr(struct autosa_gen *gen, struct autosa_hw_module *module);
+isl_stat TP_extract_array_info(struct autosa_gen *gen, struct autosa_kernel *kernel);
+TPArrayTile *TP_infer_tiled_array(
+  struct autosa_gen *gen, struct autosa_kernel *kernel, struct isl_schedule_node *node,
+  struct autosa_array_ref_group *group, int read, int write);
+
 /* AutoSA block sparsity */
 isl_stat autosa_kernel_extract_sparse_info(struct autosa_kernel *kernel, 
   struct autosa_gen *gen);
+
+#if defined(__cplusplus)
+}
+#endif  
 
 #endif

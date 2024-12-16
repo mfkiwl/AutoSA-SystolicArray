@@ -100,7 +100,7 @@ __isl_give isl_printer *print_host_serialize_arguments(
 /* FIFOs */
 __isl_give isl_printer *autosa_fifo_print_declaration_arguments(
     __isl_take isl_printer *p, struct autosa_array_ref_group *group, int n_lane,
-    const char *suffix, enum platform target);
+    const char *suffix, enum platform target, int fifo_depth, const char *direction);
 __isl_give isl_printer *autosa_fifo_print_call_argument(
     __isl_take isl_printer *p, struct autosa_array_ref_group *group,
     const char *suffix, enum platform target);
@@ -145,6 +145,10 @@ __isl_give isl_printer *print_module_serialize_body(
 __isl_give isl_printer *print_module_stmt(__isl_take isl_printer *p,
                                           __isl_take isl_ast_print_options *print_options,
                                           __isl_keep isl_ast_node *node, void *user);
+__isl_give isl_printer *print_cpu_user(
+    __isl_take isl_printer *p,
+	__isl_take isl_ast_print_options *print_options,
+	__isl_keep isl_ast_node *node, void *user);
 
 /* Xilinx-specific */
 __isl_give isl_printer *print_fifo_type_xilinx(__isl_take isl_printer *p,
@@ -163,6 +167,13 @@ __isl_give isl_printer *print_fifo_type_catapult(__isl_take isl_printer *p,
                                                  struct autosa_array_ref_group *group, int n_lane);
 __isl_give isl_printer *print_fifo_rw_catapult(__isl_take isl_printer *p,
                                                const char *fifo_name, int read);                                                 
+
+/* TAPA-specific */
+__isl_give isl_printer *print_fifo_type_tapa(__isl_take isl_printer *p,
+                                             struct autosa_array_ref_group *group,
+                                             int n_lane, int fifo_depth, const char *suffix);
+__isl_give isl_printer *print_fifo_rw_tapa(__isl_take isl_printer *p,
+                                           const char *fifo_name, int read);
 
 /* Sparse */
 isl_stat print_sparse_macros(struct autosa_kernel *kernel, struct hls_info *hls);
